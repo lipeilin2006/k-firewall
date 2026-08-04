@@ -1,0 +1,54 @@
+# ===== Rust / Cargo =====
+/target
+/target/
+**/*.rs.bk
+
+# eBPF 构建产物（aya-build / llvm 输出）
+/out
+/out/
+**/*.o
+**/*.elf
+*.bpf.o
+
+# ===== 部署 / 打包产物 =====
+# 源码同步包（scp 到 VM 用）
+/kfw-src.tgz
+*.tgz
+*.tar.gz
+
+# ===== 运行时数据 / 数据库 =====
+*.db
+*.sqlite
+*.sqlite3
+*.mmdb
+/var/lib/k-firewall/
+/data/
+*.pcap
+*.pcapng
+
+# ===== 日志 / 诊断输出 =====
+*.log
+/logs/
+/objdump.txt
+*.dump
+*.dmp
+
+# ===== 本地配置（含密钥） =====
+*.local
+*.local.yaml
+*.local.yml
+*.dev.yaml
+*.secret.yaml
+k-firewall.yaml.local
+
+# ===== 系统 / 编辑器 =====
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# ===== 测试临时文件 =====
+/tmp/
+/scratch/

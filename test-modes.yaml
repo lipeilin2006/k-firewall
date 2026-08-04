@@ -1,0 +1,48 @@
+# 三模式联合测试（veth + netns，无规则）：
+#   route:      ra0/ra1(ns1 10.0.5.2) <-> rb0/rb1(ns2 10.0.6.2) — FIB 三层转发
+#   transparent: ta0/ta1(ns1 10.0.7.2) <-> tb0/tb1(ns2 10.0.8.2) — 透明串接
+#   hybrid:     ha0/ha1(ns1 10.0.11.2) <-> hb0/hb1(ns2 10.0.12.2) — 混合串接
+#   hybrid 本机路径：ha0 地址 10.0.9.1（ns1 经 ha1 可达），目标为本机 IP 走内核。
+global:
+  node_name: kfw-test-modes
+
+interfaces:
+  # ---- 路由模式 ----
+  - name: ra0
+    role: lan
+    mode: route
+    address: 10.0.5.1
+  - name: rb0
+    role: lan
+    mode: route
+    address: 10.0.6.1
+  # ---- 透明模式 ----
+  - name: ta0
+    role: inline
+    mode: transparent
+    peer: tb0
+  - name: tb0
+    role: inline
+    mode: transparent
+    peer: ta0
+  # ---- 混合模式 ----
+  - name: ha0
+    role: inline
+    mode: hybrid
+    peer: hb0
+    address: 10.0.9.1
+  - name: hb0
+    role: inline
+    mode: hybrid
+    peer: ha0
+    address: 10.0.9.2
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false

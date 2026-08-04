@@ -1,0 +1,86 @@
+# 地址对象 / 服务对象 / CIDR 规则测试（veth + netns，route 模式）：
+#   ra0/ra1(ns1 10.0.5.2) <-> rb0/rb1(ns2 10.0.6.2)
+#
+# 验证目标：
+#   - 地址对象：LAN_NET(10.0.5.0/24) 引用 src_addr
+#   - 地址组：多个成员（10.0.6.2 + 10.0.6.0/24 网段）
+#   - 服务对象：HTTP(tcp/80) 引用 service
+#   - CIDR 目的规则（dst_addr: 10.0.6.0/24）走 RULES_LPM_DST
+#   - 精确 + CIDR 混合匹配优先级：精确 > 目的网段(src精确) > 目的网段(src任意) > ...
+global:
+  node_name: kfw-test-objects
+
+interfaces:
+  - name: ra0
+    role: lan
+    mode: route
+    address: 10.0.5.1
+  - name: rb0
+    role: lan
+    mode: route
+    address: 10.0.6.1
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false
+
+address_objects:
+  - name: LAN_NET
+    entries:
+      - 10.0.5.0/24
+  - name: SERVER_NET
+    entries:
+      - 10.0.6.2
+      - 10.0.6.0/24
+  - name: WAN_ANY
+    entries:
+      - 0.0.0.0/0
+
+address_groups:
+  - name: LAN_PLUS_DMZ
+    members:
+      - LAN_NET
+      - SERVER_NET
+
+service_objects:
+  - name: HTTP
+    proto: tcp
+    dst_port: 80
+  - name: PING
+    proto: icmp
+
+service_groups:
+  - name: WEB
+    members:
+      - HTTP
+      - PING
+
+rules:
+  # 地址对象 + 服务对象：丢弃 LAN(10.0.5.0/24) -> 任意目的 的 HTTP
+  - src_addr: LAN_NET
+    dst_addr: WAN_ANY
+    service: HTTP
+    action: drop
+  # 地址组 + 服务组：丢弃 10.0.5.0/24 -> 10.0.6.0/24 的 ICMP（两侧 CIDR，展开 src 侧）
+  - src_addr: LAN_PLUS_DMZ
+    dst_addr: SERVER_NET
+    service: PING
+    action: drop
+  # CIDR 目的规则（src 精确，dst /24）：丢弃 10.0.5.2 -> 10.0.6.0/24 的 icmp
+  - src_ip: 10.0.5.2
+    dst_addr: SERVER_NET
+    proto: icmp
+    action: drop
+  # 精确五元组仍走 RULES 精确表
+  - src_ip: 10.0.5.3
+    dst_ip: 10.0.6.3
+    proto: tcp
+    src_port: 1234
+    dst_port: 443
+    action: drop

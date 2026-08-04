@@ -1,0 +1,49 @@
+# FTP ALG 测试：route 模式 veth 对 ra0/rb0 + ns1/ns2
+#   ns1 client 10.0.5.2 --ra0-- fw --rb0-- ns2 server 10.0.6.2
+# 验证目标：
+#   - TCP 21 控制流被跟踪，载荷中 227 (被动模式) 被解析写入 ALG_EXPECT
+#   - 数据连接（默认 deny 下）命中 ALG_EXPECT 放行
+# 控制流来源端口固定为 30000（规则精确匹配），数据流用其它源端口（只有 ALG 能放行）
+global:
+  node_name: kfw-test-ftp
+
+interfaces:
+  - name: ra0
+    role: lan
+    mode: route
+    address: 10.0.5.1
+  - name: rb0
+    role: wan
+    mode: route
+    address: 10.0.6.1
+
+xdp_mode: generic
+default_action: drop
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+  http_addr: 0.0.0.0:8080
+  # 运行时规则（API 增删）持久化到 SQLite，重启自动恢复
+  db_path: /var/lib/k-firewall/k-firewall.db
+  # HTTP API Key 认证：配置后所有 /api/v1 请求必须带 X-API-Key / Authorization: Bearer
+  # 留空则不启用认证（Unix socket 本地访问不受影响）
+  api_keys: [kfw-dev-key]
+
+alg:
+  ftp_enabled: true
+
+conn_limits: []
+syn_flood:
+  rate_pps: 100
+  burst: 200
+  max_half_open: 100
+
+rules:
+  # 仅放行控制流（src 固定 30000 -> 21）；数据流由 ALG_EXPECT 放行
+  - src_addr: 10.0.5.2/32
+    dst_ip: 10.0.6.2
+    proto: tcp
+    src_port: 30000
+    dst_port: 21
+    action: pass

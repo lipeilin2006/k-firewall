@@ -1,0 +1,31 @@
+# IPv6 规则测试：drop 来自 fd00:1::2 的所有 IPv6 流量（family=6, proto=58 icmp6）
+global:
+  node_name: kfw-test-route-ipv6-rule
+
+interfaces:
+  - name: ra0
+    role: lan
+    mode: route
+  - name: rb0
+    role: lan
+    mode: route
+
+rules:
+  - src_ip: fd00:1::2
+    dst_ip: fd00:2::2
+    proto: icmp6
+    action: drop
+  - src_ip: 10.0.5.2
+    dst_ip: 10.0.6.2
+    proto: icmp
+    action: drop
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false

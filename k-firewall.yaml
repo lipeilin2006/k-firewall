@@ -1,0 +1,199 @@
+# k-firewall 主配置（YAML SSOT）
+# 缺失项使用默认值；文件不存在时 daemon 以默认配置启动。
+
+global:
+  node_name: k-firewall
+
+# 接口（VIF）定义：统一逻辑接口，打通 多WAN / 多LAN / 802.1Q VLAN / 路由 / 透明串接 / 混合。
+# 模式 mode: route（路由三层转发+SNAT）| transparent（透明串接，不改包直接重定向）| hybrid（混合）
+# 角色 role: wan | lan | inline（透明串接）
+# NAT nat: none | masquerade（route 模式出口接口；IPv4 SNAT）
+# NAT6 nat6: none | masquerade（route 模式出口接口；IPv6 源地址伪装）
+# inline 透明/混合必须给 peer（对端接口名）。
+# VLAN 子接口：给 parent（物理宿主）+ vlan_id。
+# DHCPv6 服务：给 dhcp6_server（地址池，如 "2001:db8:1::/64"）。
+interfaces:
+  # 物理 WAN（路由模式，出口 masquerade 伪装）
+  - name: wan0
+    role: wan
+    mode: route
+    address: 10.0.2.15
+    gateway: 10.0.2.2
+    nat: masquerade
+  - name: wan1
+    role: wan
+    mode: route
+    address: 10.0.3.15
+    nat: masquerade
+  # 物理 LAN（路由模式，IPv6 NAT66 + DHCPv6 地址分配）
+  - name: lan0
+    role: lan
+    mode: route
+    address: 192.168.10.1
+    dhcp_server: "192.168.10.0/24"
+    nat6: masquerade
+    dhcp6_server: "2001:db8:1::/64"
+  # 透明串接对：inline0 <-> inline1
+  - name: inline0
+    role: inline
+    mode: transparent
+    peer: inline1
+  - name: inline1
+    role: inline
+    mode: transparent
+    peer: inline0
+  # 802.1Q VLAN 子接口（挂在物理 trunk 口 trunk0 上）
+  - name: vlan100
+    parent: trunk0
+    vlan_id: 100
+    role: lan
+    mode: route
+
+# 多 WAN 组（负载均衡 / 故障切换）
+wan_groups:
+  - name: wan-group
+    members:
+      - name: wan0
+        weight: 2
+      - name: wan1
+        weight: 1
+    load_balance: weighted_hash
+    failover: true
+    health_check:
+      probe_target: 10.0.2.2
+      probe_port: 53
+      interval_secs: 5
+
+# 策略路由（M2 阶段仅解析，后续实现）
+pbr_rules:
+  - src_net: 192.168.10.0/24
+    use_wan: wan0
+
+# 区域策略（M2 阶段仅解析，后续实现）
+zone_policies:
+  - src_interface: lan0
+    dst_interface: wan0
+    action: accept
+
+# 未命中任何规则时的默认动作：pass | drop
+default_action: pass
+# XDP 挂载模式：generic | native | hardware | auto（VM/虚拟网卡一般用 generic）
+xdp_mode: generic
+# 统计打印间隔（秒）
+stats_interval_secs: 5
+
+daemon:
+  # daemon 与 CLI 之间的 Unix Domain Socket
+  unix_socket: /var/run/k-firewall.sock
+  # 可选：TCP/HTTP API 监听地址（保留 Unix socket，另开 HTTP 端口）
+  http_addr: 0.0.0.0:8080
+  # 可选：运行时规则（API 增删的 L4/L7 规则）持久化到 SQLite，重启自动恢复
+  db_path: /var/lib/k-firewall/k-firewall.db
+  # 可选：HTTP API Key 认证。配置后所有 /api/v1 请求必须带
+  # `Authorization: Bearer <key>` 或 `X-API-Key: <key>`；留空则不启用认证。
+  api_keys: []
+
+suricata:
+  enabled: true
+  # 优先使用 eve 的 Unix socket；不可用时回退到 eve_file（tail 跟踪）
+  eve_socket: /var/run/suricata.sock
+  eve_file: /var/log/suricata/eve.json
+  # severity <= 该值自动封禁（Suricata 1 最高危）
+  block_severity_max: 2
+  # 自动封禁时长（秒）；0 = 永久
+  block_seconds: 600
+  # 应用识别策略：Suricata 在 flow 事件中给出 app_proto，命中即对该流执行动作。
+  # action: pass|drop；dscp: 0-63（0 = 不标记）
+  apps:
+    - name: dns
+      action: pass
+      dscp: 0
+    - name: http
+      action: drop
+      dscp: 0
+
+multiwan:
+  enabled: false
+  probe_host: 8.8.8.8
+  probe_port: 53
+  check_interval_secs: 30
+
+# 分片策略：pass（交给内核重组）| drop（丢弃全部分片）| inspect（孤儿分片丢弃，首片继续检测）
+fragment_policy: pass
+# FRAG_TRACK 分片流条目的过期时长（秒）
+fragment_timeout_secs: 60
+
+# P0：每源 IP 并发连接数上限（防连接表耗尽 / P2P 滥用）
+conn_limits:
+  - src_ip: 192.168.10.2
+    max_conns: 1000
+
+# P0：SYN Flood 防护（每源 IP 新建连接令牌桶 + 半开上限；0 = 关闭对应项）
+syn_flood:
+  rate_pps: 1000        # 每源 IP 新建连接速率上限（pps）
+  burst: 2000           # 令牌桶突发容量
+  max_half_open: 500    # 每源 IP 半开连接数上限
+
+# P0：协议助手（ALG）
+alg:
+  ftp_enabled: true     # 解析端口 21 控制流，学习 FTP 数据连接
+
+# 连接跟踪：完整 TCP 状态机 + 每状态超时（秒；0 = 永不过期）。
+# TCP 有状态放行 / 状态推导依赖此表；关闭则回退为无状态放行（rules/zone 仍生效）。
+conntrack:
+  enabled: true
+  max_entries: 65536
+  tcp_established_secs: 432000   # 5 天
+  tcp_handshake_secs: 120        # SYN_SENT / SYN_RECV
+  tcp_closing_secs: 120          # FIN_WAIT / CLOSE_WAIT
+  tcp_time_wait_secs: 120        # TIME_WAIT / RST
+  udp_secs: 30
+  icmp_secs: 30
+  generic_secs: 600
+
+# IPv6 安全：过滤 LAN 入口的 Router Advertisement / Redirect（防路由注入）。
+ipv6:
+  ra_filter: false
+
+# QoS：XDP 入口按首匹配打 DSCP + 每类入口限速；出口可按 DSCP 用 HTB 整形。
+qos:
+  # 分类（首个匹配生效；ingress_iface / proto / src_port / dst_port 为 0 即通配）
+  classes:
+    - name: voice
+      dscp: 46            # EF
+      proto: udp
+      dst_port: 5060
+      rate_bps: 512000
+      burst_bytes: 16384
+    - name: bulk
+      dscp: 18            # AF21
+      proto: tcp
+      dst_port: 0
+      rate_bps: 0         # 仅打标不限速
+      burst_bytes: 16384
+  # 出口整形（HTB；interface 为逻辑名，default_classid 需已在 classes 中定义）
+  shaping:
+    - interface: lan0
+      default_classid: "1:10"
+      classes:
+        - classid: "1:10"
+          dscp: 0
+          rate_bps: 8000000
+          ceil_bps: 10000000
+          burst_bytes: 32768
+        - classid: "1:20"
+          dscp: 46
+          rate_bps: 512000
+          ceil_bps: 1024000
+          burst_bytes: 16384
+
+# 静态规则：精确五元组（通配 / CIDR 匹配将在后续里程碑引入）。
+# tcp/udp 规则必须给出 src_port 与 dst_port。
+rules: []
+# rules:
+#   - src_ip: 192.168.10.5
+#     dst_ip: 10.0.2.15
+#     proto: tcp
+#     src_port: 12345
+#     dst_port: 443
+#     action: drop

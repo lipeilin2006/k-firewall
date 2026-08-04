@@ -1,0 +1,45 @@
+[package]
+name = "k-firewalld"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+k-firewall-common = { path = "../k-firewall-common", features = ["api", "user"] }
+
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+aya-log = { workspace = true }
+axum = "0.8"
+clap = { workspace = true, features = ["derive"] }
+libc = { workspace = true }
+rusqlite = { workspace = true }
+scalar_api_reference = { workspace = true }
+serde = { workspace = true, default-features = true }
+serde_json = { workspace = true, default-features = true }
+serde_yaml = { workspace = true, default-features = true }
+suricatax-rule-parser = "0.2.0-alpha.1"
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+] }
+tokio-stream = { workspace = true, features = ["sync"] }
+tracing = { workspace = true, default-features = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+cargo_metadata = { workspace = true }
+
+[[bin]]
+name = "k-firewalld"
+path = "src/main.rs"

@@ -1,0 +1,32 @@
+# 透明模式（inline 串接）检测测试：
+#   ns1(10.0.5.2) --a1/a0-- [XDP 透明转发] --b0/b1-- ns2(10.0.6.2)
+# a0 <-> b0 为透明对端，XDP 上 a0/b0 双向重定向，不改包。
+# 用于验证：透明模式下 BLOCKED / 五元组规则同样生效。
+global:
+  node_name: kfw-test-transparent
+
+interfaces:
+  - name: a0
+    role: inline
+    mode: transparent
+    peer: b0
+  - name: b0
+    role: inline
+    mode: transparent
+    peer: a0
+
+rules:
+  - src_ip: 10.0.5.2
+    dst_ip: 10.0.6.2
+    proto: icmp
+    action: drop
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false

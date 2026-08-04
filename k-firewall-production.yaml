@@ -1,0 +1,131 @@
+# k-firewall 生产环境模板：默认拒绝（default-deny）+ 最小暴露面
+#
+# 用法：部署时以本文件为 base，按实际接口/网段调整。
+#   - default_action: drop（未匹配任何规则/Zone/Conntrack 回程 => 丢弃）
+#   - 已建连接的回程由 CONNTRACK 状态机放行（stateful）
+#   - 每源连接数上限 + SYN Flood 防护默认开启
+#   - FTP ALG 开启（控制流解析数据连接），其余协议助手按需加
+#   - Suricata 联动：高严重度 alert 自动封禁源 IP
+#
+# 安全基线：
+#   1) 仅放行"必要"流量（管理 + LAN 出站 + 明确开放的入站服务）
+#   2) 所有入站 NEW 连接默认拒绝；回程依赖状态
+#   3) 防 DDoS：连接数配额 + SYN 令牌桶 + 半开上限
+#   4) 防扫描 / 分片攻击：fragment_policy: inspect（孤儿分片丢弃）
+
+global:
+  node_name: kfw-production
+
+interfaces:
+  - name: wan0
+    role: wan
+    mode: route
+    address: 10.0.2.15
+    gateway: 10.0.2.2
+    nat: masquerade
+  - name: lan0
+    role: lan
+    mode: route
+    address: 192.168.10.1
+
+xdp_mode: generic
+# 核心：默认拒绝。未匹配任何规则/Zone 的包一律丢弃。
+default_action: drop
+stats_interval_secs: 5
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+# 区域策略：接口对间的显式许可。
+# 注意：反向（回程）流量由 CONNTRACK 放行，无需在此写反向规则。
+zone_policies:
+  # 管理平面：仅允许 LAN 访问（Web GUI / API 走 lan0）。
+  - src_interface: lan0
+    dst_interface: lan0
+    action: accept
+  # LAN 出站上网。
+  - src_interface: lan0
+    dst_interface: wan0
+    action: accept
+  # 入站服务按需开放（示例：DMZ 或端口转发，见 rules/nat_rules）。
+
+# 精确规则：放行必要入站服务（示例）。
+# 注意：回程已由 conntrack 放行；这里只放 NEW 方向。
+rules:
+  # 允许 WAN 口 SSH（如确需远程管理；否则删除）。
+  - src_addr: 0.0.0.0/0
+    dst_ip: 10.0.2.15
+    proto: tcp
+    dst_port: 22
+    action: pass
+
+# 端口转发（DNAT）示例：把 WAN 的 8080 转发到内网 192.168.10.50:8080。
+# nat_rules:
+#   - dst_ip: 10.0.2.15
+#     dst_port: 8080
+#     proto: tcp
+#     to_ip: 192.168.10.50
+#     to_port: 8080
+
+suricata:
+  enabled: true
+  eve_socket: /var/run/suricata.sock
+  eve_file: /var/log/suricata/eve.json
+  # severity <= 2 自动封禁（1 最高危）。
+  block_severity_max: 2
+  block_seconds: 3600
+  apps:
+    - name: http
+      action: drop
+      dscp: 0
+    - name: dns
+      action: pass
+      dscp: 0
+
+# 分片策略：inspect（首片继续检测，非首片必须属于已放行流，孤儿分片丢弃）。
+fragment_policy: inspect
+fragment_timeout_secs: 30
+
+# 连接跟踪：状态化放行 + 每状态超时。
+conntrack:
+  enabled: true
+  max_entries: 65536
+  tcp_established_secs: 432000
+  tcp_handshake_secs: 120
+  tcp_closing_secs: 120
+  tcp_time_wait_secs: 120
+  udp_secs: 30
+  icmp_secs: 30
+  generic_secs: 600
+
+# IPv6：过滤 Router Advertisement / Redirect（防路由注入）。
+ipv6:
+  ra_filter: true
+
+# P0：每源 IP 并发连接数上限（防连接表耗尽）。
+# 注意：conn_limits 为精确 IP（非 CIDR）；需要网段时在 rules 或程序化扩展中实现。
+conn_limits:
+  - src_ip: 192.168.10.1
+    max_conns: 4096
+  - src_ip: 192.168.10.50
+    max_conns: 4096
+  - src_ip: 0.0.0.0
+    max_conns: 512
+
+# P0：SYN Flood 防护。
+syn_flood:
+  rate_pps: 2000
+  burst: 4000
+  max_half_open: 1024
+
+# P0：协议助手。
+alg:
+  ftp_enabled: true
+
+# QoS：默认全量转发，可按需分类限速。
+qos:
+  classes: []
+  shaping: []
+
+# 源 IP 速率限制：额外一层 DDoS 缓解（可选）。
+rate_limit_rules: []

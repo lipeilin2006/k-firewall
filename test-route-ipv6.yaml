@@ -1,0 +1,24 @@
+# IPv6 路由模式 FIB 测试：veth 两对 + 两个 netns
+#   ra0(fd00:1::1) <-> ra1(ns1 fd00:1::2)
+#   rb0(fd00:2::1) <-> rb1(ns2 fd00:2::2)
+# ns1/ns2 经 ra0/rb0 上的 XDP 走 bpf_fib_lookup IPv6 转发。
+global:
+  node_name: kfw-test-route-ipv6
+
+interfaces:
+  - name: ra0
+    role: lan
+    mode: route
+  - name: rb0
+    role: lan
+    mode: route
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false

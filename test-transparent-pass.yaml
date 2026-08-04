@@ -1,0 +1,25 @@
+# 透明模式（inline 串接）基础连通测试（无规则）：
+#   ns1(10.0.5.2) --a1/a0-- [XDP 透明转发] --b0/b1-- ns2(10.0.6.2)
+# 用于对照：无规则时透明转发正常，规则检测位于重定向之前。
+global:
+  node_name: kfw-test-transparent-pass
+
+interfaces:
+  - name: a0
+    role: inline
+    mode: transparent
+    peer: b0
+  - name: b0
+    role: inline
+    mode: transparent
+    peer: a0
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false

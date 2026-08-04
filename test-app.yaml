@@ -1,0 +1,62 @@
+# Suricata app_proto 应用策略测试
+#   client0 enp0s3=kfw-lan0 -> fw lan0 (route 192.168.10.1) -> wan0 (route 10.0.2.15, masquerade)
+# 验证目标：
+#   - Suricata 识别 client0 的 HTTP 流量（app_proto=http）
+#   - daemon 从 eve 事件写 APP_MAP（http -> drop）
+#   - XDP 命中 APP_MAP 丢弃该流（http 流量被拦截）
+global:
+  node_name: kfw-test-app
+
+interfaces:
+  - name: lan0
+    role: lan
+    mode: route
+    address: 192.168.10.1
+  - name: wan0
+    role: wan
+    mode: route
+    address: 10.0.2.15
+    gateway: 10.0.2.2
+    nat: masquerade
+
+xdp_mode: generic
+default_action: pass
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: true
+  eve_socket: /var/run/suricata/eve.sock
+  eve_file: /var/log/suricata/eve.json
+  block_severity_max: 2
+  block_seconds: 600
+  apps:
+    - name: http
+      action: drop
+      dscp: 0
+    - name: dns
+      action: pass
+      dscp: 0
+
+zone_policies:
+  # 默认 deny 下，显式允许 lan0 -> wan0 网段（client0 上网）
+  - src_interface: lan0
+    dst_interface: wan0
+    action: accept
+
+# P0：每源连接数上限 + SYN Flood 防护（VM 验证用）
+conn_limits:
+  - src_ip: 192.168.10.2
+    max_conns: 5
+
+syn_flood:
+  rate_pps: 10
+  burst: 20
+  max_half_open: 20
+
+alg:
+  ftp_enabled: true
+
+rules: []

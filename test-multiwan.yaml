@@ -1,0 +1,63 @@
+# 多 WAN failover + PBR 测试配置（匹配 VM 实际拓扑）
+#   wan0 10.0.2.15 gw 10.0.2.2（主）
+#   wan1 10.0.2.25 gw 10.0.2.2（备）
+# 验证：wan0 探活正常时默认路由保持 wan0；人为 down wan0 后切 wan1。
+
+global:
+  node_name: kfw-test-multiwan
+
+interfaces:
+  - name: wan0
+    role: wan
+    mode: route
+    address: 10.0.2.15
+    gateway: 10.0.2.2
+    nat: masquerade
+  - name: wan1
+    role: wan
+    mode: route
+    address: 10.0.2.25
+    gateway: 10.0.2.2
+    nat: masquerade
+  - name: lan0
+    role: lan
+    mode: route
+    address: 192.168.10.1
+
+xdp_mode: generic
+default_action: drop
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+
+suricata:
+  enabled: false
+
+multiwan:
+  enabled: true
+  probe_host: 8.8.8.8
+  probe_port: 53
+  check_interval_secs: 3
+
+wan_groups:
+  - name: wan-group
+    members:
+      - name: wan0
+        weight: 2
+      - name: wan1
+        weight: 1
+    load_balance: weighted_hash
+    failover: true
+    health_check:
+      probe_target: 8.8.8.8
+      probe_port: 53
+      interval_secs: 3
+
+pbr_rules:
+  - src_net: 192.168.10.0/24
+    use_wan: wan0
+
+zone_policies: []
+
+rules: []

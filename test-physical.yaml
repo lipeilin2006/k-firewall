@@ -1,0 +1,99 @@
+# 真实物理接线测试（方案 A，已获用户确认）：
+#   client0 enp0s3=kfw-lan0 -> fw lan0 (route 192.168.10.1)     -> wan0 (route 10.0.2.15 NAT)  出网
+#   client1 enp0s3=kfw-lan1 -> fw lan1 (route 192.168.20.1)     -> wan0 (共享 masquerade)     出网
+#   client2 enp0s3=kfw-lan2 -> fw lan2 (transparent) <-> wan1 (transparent, VBox NAT 10.0.3.x)
+#   client3 enp0s3=kfw-lan3 -> fw lan3 (transparent) <-> wan2 (transparent, VBox NAT 10.0.4.x)
+# 验证目标：
+#   - route + NAT: client0/client1 共享 wan0 出网，源地址均为 10.0.2.15 masquerade
+#   - transparent: client2 经 lan2<->wan1、client3 经 lan3<->wan2 DHCP 拿对应网段
+#   - Suricata API 规则 + prefilter: client0 -> client1:8000 (TCP) 放行，ICMP 被 prefilter 拦截
+global:
+  node_name: kfw-test-physical-a
+
+interfaces:
+  - name: lan0
+    role: lan
+    mode: route
+    address: 192.168.10.1
+  - name: wan0
+    role: wan
+    mode: route
+    address: 10.0.2.15
+    gateway: 10.0.2.2
+    nat: masquerade
+  - name: lan1
+    role: lan
+    mode: route
+    address: 192.168.20.1
+  - name: lan2
+    role: inline
+    mode: transparent
+    peer: wan1
+  - name: wan1
+    role: wan
+    mode: transparent
+    peer: lan2
+  - name: lan3
+    role: inline
+    mode: transparent
+    peer: wan2
+  - name: wan2
+    role: wan
+    mode: transparent
+    peer: lan3
+
+xdp_mode: generic
+default_action: drop
+stats_interval_secs: 3
+
+daemon:
+  unix_socket: /var/run/k-firewall.sock
+  http_addr: 0.0.0.0:8080
+  api_keys:
+    - kfw-dev-key
+  db_path: /var/lib/k-firewall/k-firewall.db
+
+suricata:
+  enabled: false
+  # 预过滤开关：关闭时 API 规则不影响数据面；开启后未命中规则头的新建流被线速丢弃。
+  prefilter: false
+  eve_socket: "/var/run/suricata.sock"
+  eve_file: "/var/log/suricata/eve.json"
+
+zone_policies:
+  # client0 经 lan0 -> wan0 出网
+  - src_interface: lan0
+    dst_interface: wan0
+    action: accept
+  # client1 经 lan1 -> wan0 出网（共享 NAT 出口）
+  - src_interface: lan1
+    dst_interface: wan0
+    action: accept
+  # client2 transparent lan2 <-> wan1
+  - src_interface: lan2
+    dst_interface: wan1
+    action: accept
+  # client3 transparent lan3 <-> wan2
+  - src_interface: lan3
+    dst_interface: wan2
+    action: accept
+  # 跨 LAN 测试 Suricata 规则：client0 -> client1 (192.168.20.2:8000 HTTP)
+  - src_interface: lan0
+    dst_interface: lan1
+    action: accept
+
+rules: []
+
+nat_rules:
+  # 端口转发：WAN(10.0.2.15):8080 -> client0(192.168.10.2):80
+  - dst_ip: 10.0.2.15
+    dst_port: 8080
+    proto: tcp
+    to_ip: 192.168.10.2
+    to_port: 80
+
+rate_limit_rules:
+  # client0 限速：100 pps，突发 50（验证令牌桶丢弃路径）
+  - src_ip: 192.168.10.2
+    rate: 100
+    burst: 50
