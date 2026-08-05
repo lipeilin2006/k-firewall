@@ -524,7 +524,7 @@ pub struct QosConfig {
 
 /// `QOS_BUCKETS` 值：每类入口限速的令牌桶（per-CPU，无竞争）。
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct QosBucket {
     /// 当前可用令牌（字节）。
     pub tokens: u32,
@@ -534,7 +534,7 @@ pub struct QosBucket {
 
 impl QosBucket {
     pub fn new() -> Self {
-        Self { tokens: 0, last: 0 }
+        Self::default()
     }
 }
 
@@ -551,7 +551,7 @@ pub struct ConnLimit {
 
 /// `SYN_LIMITS` 表值：per-source-IP SYN 令牌桶（每源 IP 新建连接速率）。
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SynState {
     /// 上次令牌填充时刻（CLOCK_MONOTONIC，ns）。
     pub last: u64,
@@ -561,7 +561,7 @@ pub struct SynState {
 
 impl SynState {
     pub fn new() -> Self {
-        Self { last: 0, tokens: 0 }
+        Self::default()
     }
 }
 

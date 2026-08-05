@@ -32,8 +32,6 @@ use network_types::{
     eth::{EthHdr, EtherType},
     icmp::Icmpv6Hdr,
     ip::{Ipv4Hdr, Ipv6Hdr},
-    tcp::TcpHdr,
-    udp::UdpHdr,
     vlan::VlanHdr,
 };
 
@@ -302,7 +300,7 @@ fn rate_limited(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], now: u64) -> bool
     let state = unsafe { &mut *state_ptr.unwrap() };
     if now > state.last {
         let elapsed = now - state.last;
-        let add = (elapsed as u64 * state.rate as u64) / 1_000_000_000;
+        let add = (elapsed * state.rate as u64) / 1_000_000_000;
         let add = add.min(state.burst as u64 - state.tokens as u64);
         state.tokens += add as u32;
         state.last = now;
@@ -399,7 +397,7 @@ fn syn_flood_check(
                 let state = unsafe { &mut *p };
                 if now > state.last {
                     let elapsed = now - state.last;
-                    let add = (elapsed as u64 * rate as u64) / 1_000_000_000;
+                    let add = (elapsed * rate as u64) / 1_000_000_000;
                     let add = add.min(burst as u64 - state.tokens as u64);
                     state.tokens += add as u32;
                     state.last = now;
@@ -507,7 +505,7 @@ fn ct_expired(v: &CtValue, now: u64) -> bool {
 /// FTP ALG 预期条目的学习已迁移到用户态：daemon 解析 Suricata eve `ftp` 事件
 /// （`command` + `dynamic_port`，覆盖主动 PORT 与被动 PASV/227），向 `ALG_EXPECT`
 /// 写入预期数据连接五元组（`src_port=0` 通配）。eBPF 不再扫描载荷。
-
+///
 /// 查询 `ALG_EXPECT` 是否命中（未过期）：匹配"预期数据连接"五元组。
 #[inline(always)]
 fn alg_expect_hit(flow: &FiveTuple, now: u64) -> bool {
@@ -528,7 +526,7 @@ fn alg_expect_hit(flow: &FiveTuple, now: u64) -> bool {
 /// FTP ALG 预期条目的学习已迁移到用户态：daemon 解析 Suricata eve `ftp` 事件
 /// （`command` + `dynamic_port`，覆盖主动 PORT 与被动 PASV/227），向 `ALG_EXPECT`
 /// 写入预期数据连接五元组（`src_port=0` 通配）。eBPF 不再扫描载荷。
-
+///
 /// TCP 状态转移：按当前包标志位与方向推进状态机。
 #[inline(always)]
 fn ct_tcp_step(flags: u8, reply: bool, cur: u8) -> u8 {
@@ -686,7 +684,7 @@ fn mark_ipv4_dscp(ctx: &XdpContext, l3_off: usize, dscp: u8) {
     let mut sum: u32 = ((!hc) & 0xFFFF) + ((!m_old) & 0xFFFF) + m_new;
     sum = (sum & 0xFFFF) + (sum >> 16);
     sum = (sum & 0xFFFF) + (sum >> 16);
-    let new_hc = (!(sum as u16)) & 0xFFFF;
+    let new_hc = !(sum as u16);
     // 回写 tos 与校验和（网络序字节）。
     let tos_mut = unsafe { ptr_at_mut::<u8>(ctx, l3_off + 1) };
     let c0_mut = unsafe { ptr_at_mut::<u8>(ctx, l3_off + 10) };
@@ -986,7 +984,7 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                     let f1 = unsafe { *ptr_at::<u8>(&ctx, l4_off + 3)? };
                     let frag_field: u16 = ((f0 as u16) << 8) | (f1 as u16);
                     let offset = frag_field >> 3;
-                    let m = frag_field & 0x1;
+                    let _m = frag_field & 0x1;
                     proto = next;
                     l4_off += 8;
                     if l4_off > MAX_L4_OFF {
