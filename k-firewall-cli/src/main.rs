@@ -12,6 +12,9 @@ struct Cli {
     /// daemon 的 Unix Domain Socket 路径
     #[clap(long, global = true, default_value = "/var/run/k-firewall.sock")]
     socket: PathBuf,
+    /// API 密钥（与 daemon 配置 api_keys 匹配）；通过 HTTP 管理时必须提供
+    #[clap(long, global = true, env = "K_FIREWALL_API_KEY")]
+    api_key: Option<String>,
     #[clap(subcommand)]
     cmd: Cmd,
 }
@@ -66,13 +69,19 @@ async fn main() -> Result<ExitCode> {
         }
     };
 
-    let resp = request(&cli.socket, method, path, body).await?;
+    let resp = request(&cli.socket, &cli.api_key, method, path, body).await?;
     print!("{resp}");
     Ok(ExitCode::SUCCESS)
 }
 
 /// 通过 Unix Domain Socket 发送一个 HTTP/1.1 请求并返回响应体（美化 JSON）。
-async fn request(sock: &Path, method: &str, path: &str, body: Option<Vec<u8>>) -> Result<String> {
+async fn request(
+    sock: &Path,
+    api_key: &Option<String>,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+) -> Result<String> {
     let mut stream = UnixStream::connect(sock)
         .await
         .with_context(|| format!("connect {}", sock.display()))?;
@@ -83,6 +92,9 @@ async fn request(sock: &Path, method: &str, path: &str, body: Option<Vec<u8>>) -
     );
     if body.is_some() {
         head.push_str("Content-Type: application/json\r\n");
+    }
+    if let Some(k) = api_key {
+        head.push_str(&format!("X-API-Key: {k}\r\n"));
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await?;

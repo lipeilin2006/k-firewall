@@ -8,7 +8,7 @@ license.workspace = true
 k-firewall-common = { path = "../k-firewall-common", features = ["api"] }
 
 anyhow = { workspace = true, default-features = true }
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 serde_json = { workspace = true, default-features = true }
 tokio = { workspace = true, features = [
     "macros",

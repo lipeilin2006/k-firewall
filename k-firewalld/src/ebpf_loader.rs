@@ -652,7 +652,10 @@ impl EbpfHandle {
         let mut zone: Array<_, ZoneEntry> =
             Array::try_from(ebpf.take_map("ZONE").context("ZONE map not found")?)?;
         let zone_entries = config.zone_entries();
-        for (i, (phy, dst_net, prefix_len, action)) in zone_entries.iter().enumerate() {
+        // 数组上限 ZONE_MAX：配置超出时截断加载，避免 set 越界失败；数量以实际写入为准。
+        for (i, (phy, dst_net, prefix_len, action)) in
+            zone_entries.iter().take(k_firewall_common::maps::ZONE_MAX as usize).enumerate()
+        {
             let idx = if_index(&phy)
                 .with_context(|| format!("zone: cannot resolve ifindex for {}", phy))?;
             zone.set(
@@ -663,6 +666,14 @@ impl EbpfHandle {
             info!(
                 "ZONE[{}] src={} (ifindex={}) dst_net={:?}/{} action={}",
                 i, phy, idx, dst_net, prefix_len, action
+            );
+        }
+        if zone_entries.len() > k_firewall_common::maps::ZONE_MAX as usize {
+            warn!(
+                "zone_entries ({} entries) exceeds ZONE_MAX ({}), truncating to {}",
+                zone_entries.len(),
+                k_firewall_common::maps::ZONE_MAX,
+                k_firewall_common::maps::ZONE_MAX
             );
         }
         {

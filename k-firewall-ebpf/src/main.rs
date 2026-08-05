@@ -193,8 +193,9 @@ static QOS_BUCKETS: PerCpuArray<QosBucket> =
 pub fn k_firewall(ctx: XdpContext) -> u32 {
     match try_k_firewall(ctx) {
         Ok(ret) => ret,
-        // 无法解析（如截断的短包）时放行，交由内核协议栈处理。
-        Err(_) => xdp_action::XDP_PASS,
+        // 无法解析（如截断的短包、非 IP 之外无法识别的畸形帧）时丢弃：
+        // 防火墙对畸形包应 fail-closed，避免绕过封禁/分片检查。
+        Err(_) => xdp_action::XDP_DROP,
     }
 }
 
@@ -304,8 +305,17 @@ fn rate_limited(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], now: u64) -> bool
     let state = unsafe { &mut *state_ptr.unwrap() };
     if now > state.last {
         let elapsed = now - state.last;
+        // burst=0 时按 1 处理：避免桶永不回填导致配置 rate>0 也被全丢弃。
+        let burst = (state.burst as u64).max(1);
+        // 限制重填窗口防止乘法溢出（bpf 目标不支持 saturating_mul/u128）：
+        // 窗口最大 1000s，rate≤4G，乘积 ≤4e12 远小于 u64 上限。
+        let elapsed = if elapsed > 1_000_000_000_000 {
+            1_000_000_000_000
+        } else {
+            elapsed
+        };
         let add = (elapsed * state.rate as u64) / 1_000_000_000;
-        let add = add.min(state.burst as u64 - state.tokens as u64);
+        let add = add.min(burst - state.tokens as u64);
         state.tokens += add as u32;
         state.last = now;
     }
@@ -327,10 +337,11 @@ fn src_ip_key(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16]) -> IpKey {
     }
 }
 
-/// 每源 IP 并发连接数检查：超过 `CONN_LIMITS` 上限则丢弃，否则 `CONN_COUNT` +1。
+/// 每源 IP 并发连接数检查：超过 `CONN_LIMITS` 上限返回 `true`（应丢弃）。
 ///
-/// 只在新建流首包（本函数返回 true 代表应丢弃）调用一次；`CONN_COUNT` 的递减由
-/// 连接关闭路径（`ct_count_dec`）与 daemon 周期校正共同完成。
+/// 只做判定不修改 `CONN_COUNT`；新建流被接受后才由 `conn_count_inc` 计入，
+/// 避免被后续检查丢弃的首包污染计数。`CONN_COUNT` 的递减由连接关闭路径
+/// （`conn_count_dec`）与 daemon 周期校正共同完成。
 #[inline(always)]
 fn conn_limit_check(ctx: &XdpContext, is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16]) -> bool {
     let key = src_ip_key(is_ipv4, src_ip, src_ip6);
@@ -352,13 +363,28 @@ fn conn_limit_check(ctx: &XdpContext, is_ipv4: bool, src_ip: u32, src_ip6: [u8; 
         );
         return true;
     }
+    false
+}
+
+/// 新建流被接受后为源 IP 记录并发连接计数（仅在配置了每源上限时计入）。
+/// 返回是否实际计数（决定调用方是否设置 `CT_COUNTED_CONN`）。
+#[inline(always)]
+fn conn_count_inc(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16]) -> bool {
+    let key = src_ip_key(is_ipv4, src_ip, src_ip6);
+    let limit = match unsafe { CONN_LIMITS.get(&key) } {
+        Some(l) => l.max_conns,
+        None => return false,
+    };
+    if limit == 0 {
+        return false;
+    }
     match CONN_COUNT.get_ptr_mut(&key) {
         Some(p) => unsafe { *p += 1 },
         None => {
             let _ = CONN_COUNT.insert(&key, &1, 0);
         }
     }
-    false
+    true
 }
 
 /// 连接关闭 / 超时回收时递减每源 `CONN_COUNT`。
@@ -401,6 +427,12 @@ fn syn_flood_check(
                 let state = unsafe { &mut *p };
                 if now > state.last {
                     let elapsed = now - state.last;
+                    // 限制重填窗口防止乘法溢出（bpf 目标不支持 saturating_mul/u128）。
+                    let elapsed = if elapsed > 1_000_000_000_000 {
+                        1_000_000_000_000
+                    } else {
+                        elapsed
+                    };
                     let add = (elapsed * rate as u64) / 1_000_000_000;
                     let add = add.min(burst as u64 - state.tokens as u64);
                     state.tokens += add as u32;
@@ -426,7 +458,8 @@ fn syn_flood_check(
         }
     }
 
-    // 半开连接数上限（SYN_SENT/SYN_RECV 状态）。
+    // 半开连接数上限（SYN_SENT/SYN_RECV 状态）。只判定不计数，
+    // 计数延后到新建流被接受后（`syn_count_inc`）。
     if max_half > 0 {
         let cur = unsafe { SYN_COUNT.get(&key) }.copied().unwrap_or(0);
         if cur >= max_half {
@@ -439,14 +472,25 @@ fn syn_flood_check(
             );
             return true;
         }
-        match SYN_COUNT.get_ptr_mut(&key) {
-            Some(p) => unsafe { *p += 1 },
-            None => {
-                let _ = SYN_COUNT.insert(&key, &1, 0);
-            }
-        }
     }
     false
+}
+
+/// 新建 TCP SYN 被接受后为源 IP 记录半开连接计数（仅在半开上限启用时计入）。
+/// 返回是否实际计数（决定调用方是否设置 `CT_COUNTED_SYN`）。
+#[inline(always)]
+fn syn_count_inc(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16]) -> bool {
+    if CONFIG.get(CONFIG_SYN_MAX_HALFOPEN).copied().unwrap_or(0) == 0 {
+        return false;
+    }
+    let key = src_ip_key(is_ipv4, src_ip, src_ip6);
+    match SYN_COUNT.get_ptr_mut(&key) {
+        Some(p) => unsafe { *p += 1 },
+        None => {
+            let _ = SYN_COUNT.insert(&key, &1, 0);
+        }
+    }
+    true
 }
 
 /// 半开连接关闭 / 握手完成时递减每源 `SYN_COUNT`。
@@ -648,7 +692,13 @@ fn apply_qos(
                 let bucket = unsafe { &mut *bucket };
                 if now > bucket.last {
                     let elapsed = now - bucket.last;
-                    let add = (elapsed as u64 * cfg.rate_bps as u64) / 1_000_000_000;
+                    // 限制重填窗口防止乘法溢出（bpf 目标不支持 saturating_mul/u128）。
+                    let elapsed = if elapsed > 1_000_000_000_000 {
+                        1_000_000_000_000
+                    } else {
+                        elapsed
+                    };
+                    let add = (elapsed * cfg.rate_bps as u64) / 1_000_000_000;
                     let add = add.min(cfg.burst_bytes as u64 - bucket.tokens as u64);
                     bucket.tokens += add as u32;
                     bucket.last = now;
@@ -677,8 +727,9 @@ fn mark_ipv4_dscp(ctx: &XdpContext, l3_off: usize, dscp: u8) {
     if new_tos == old_tos {
         return;
     }
-    // tot_len[0] 参与 TOS 所在 16 位字，读取并保持。
-    let tot_len0 = match unsafe { ptr_at::<u8>(ctx, l3_off + 2) } {
+    // TOS 位于 16 位字（字节 0..2）：vihl（版本+头长）在字节 0，tos 在字节 1。
+    // 读取并保持 vihl，仅 tos 参与增量。
+    let vihl = match unsafe { ptr_at::<u8>(ctx, l3_off) } {
         Ok(p) => unsafe { *p },
         Err(_) => return,
     };
@@ -689,8 +740,8 @@ fn mark_ipv4_dscp(ctx: &XdpContext, l3_off: usize, dscp: u8) {
         return;
     };
     let hc: u32 = (((unsafe { *c0 }) as u32) << 8) | (unsafe { *c1 }) as u32;
-    let m_old: u32 = ((old_tos as u32) << 8) | (tot_len0 as u32);
-    let m_new: u32 = ((new_tos as u32) << 8) | (tot_len0 as u32);
+    let m_old: u32 = ((vihl as u32) << 8) | (old_tos as u32);
+    let m_new: u32 = ((vihl as u32) << 8) | (new_tos as u32);
     // RFC 1624: HC' = ~(~HC + ~m + m')（折叠）。
     // eBPF verifier 对 while 循环状态爆炸，这里展开为固定两次折叠：
     // u32 最多两次进位后 sum < 2^16。
@@ -1543,7 +1594,7 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
-    // P0：每源并发连接数上限（新建流计数）。
+    // P0：每源并发连接数上限（新建流检查，只判定不计数）。
     if conn_limit_check(&ctx, is_ipv4, src_ip, src_ip6) {
         bump_stats(false, false);
         info!(
@@ -1556,19 +1607,31 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         return Ok(xdp_action::XDP_DROP);
     }
 
+    // 仅在被接受并成功建条时计入每源计数，避免被后续步骤丢弃的首包污染计数。
     let mut nv = CtValue::new(initial);
     nv.last_seen = now;
     nv.pkts_orig = 1;
     nv.bytes_orig = (ctx.data_end() - ctx.data()) as u64;
-    if tcp_syn {
-        nv.counted |= CT_COUNTED_SYN;
-    }
-    nv.counted |= CT_COUNTED_CONN;
     if frag.is_fragmented != 0 {
         nv.has_fragments = 1;
-        frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
     }
     if CONNTRACK.insert(&flow_key, &nv, 0).is_ok() {
+        // 建条成功后才计入每源计数，与 `ct_counters_tick` 的递减保持对称。
+        // 计数标志写入已存储的条目，供关闭路径递减。
+        if tcp_syn && syn_count_inc(is_ipv4, src_ip, src_ip6) {
+            if let Some(p) = CONNTRACK.get_ptr_mut(&flow_key) {
+                unsafe { (*p).counted |= CT_COUNTED_SYN };
+            }
+        }
+        if conn_count_inc(is_ipv4, src_ip, src_ip6) {
+            // 有该源 IP 的并发上限：置 CT_COUNTED_CONN 供关闭路径递减。
+            if let Some(p) = CONNTRACK.get_ptr_mut(&flow_key) {
+                unsafe { (*p).counted |= CT_COUNTED_CONN };
+            }
+        }
+        if frag.is_fragmented != 0 {
+            frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
+        }
         info!(
             &ctx,
             "CT NEW family={} proto={} sport={} dport={} state={}",

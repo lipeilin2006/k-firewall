@@ -149,14 +149,37 @@ impl AppState {
             map
         };
 
-        // 恢复持久化的 QoS 分类并同步到 eBPF（QOS_CLASSES）。启动期间
-        // 同步失败仅告警：分类仍保留在内存/DB，运行时可重试。
+        // 恢复持久化的 QoS 分类并同步到 eBPF（QOS_CLASSES）。DB 为空时从配置播种
+        // （DB 为运行时事实源），再同步 eBPF。启动期间同步失败仅告警：
+        // 分类仍保留在内存/DB，运行时可重试。
         let qos_classes = {
             let mut rows = Vec::new();
             if let Some(p) = &persist {
                 match p.load_qos_classes() {
                     Ok(r) => rows = r,
                     Err(e) => warn!("failed to load qos classes from db: {e:#}"),
+                }
+                if rows.is_empty() && !config.qos.classes.is_empty() {
+                    for c in &config.qos.classes {
+                        if let Err(e) = p.insert_qos_class(&crate::persist::QosClassRow {
+                            id: None,
+                            name: c.name.clone(),
+                            dscp: c.dscp,
+                            ingress_iface: c.ingress_iface.clone().unwrap_or_default(),
+                            proto: c.proto.clone(),
+                            src_port: c.src_port,
+                            dst_port: c.dst_port,
+                            rate_bps: c.rate_bps,
+                            burst_bytes: c.burst_bytes,
+                            enabled: true,
+                        }) {
+                            warn!("failed to seed qos class from config: {e:#}");
+                        }
+                    }
+                    match p.load_qos_classes() {
+                        Ok(r) => rows = r,
+                        Err(e) => warn!("failed to reload qos classes: {e:#}"),
+                    }
                 }
             }
             rows
@@ -1806,12 +1829,15 @@ impl AppState {
                     (Some(a), Some(b)) => (a, b),
                     _ => return Ok(None),
                 };
-                let tmp = list[i_a].id;
-                list[i_a].id = list[i_b].id;
-                list[i_b].id = tmp;
+                // 交换执行顺序 = 交换 Vec 位置；id 保持不变。
+                list.swap(i_a, i_b);
             }
         }
-        self.resync_zone_policies().await?;
+        // eBPF 重同步为尽力而为：DB 已提交（顺序已改），同步失败仅告警不报错，
+        // 避免调用方收到失败却已生效的歧义状态。
+        if let Err(e) = self.resync_zone_policies().await {
+            warn!("swap_zone_policies: eBPF resync failed after commit: {e:#}");
+        }
         let list = self.zone_policies.lock().unwrap();
         let a = list.iter().find(|r| r.id == Some(id_a as i64));
         let b = list.iter().find(|r| r.id == Some(id_b as i64));
@@ -2010,8 +2036,24 @@ fn zone_entries_from_rows(
             }
             None => (0u32, 0u32),
         };
-        let src_idx = crate::ebpf_loader::if_index(&src.phy_name()).unwrap_or(0) as u32;
-        let dst_idx = crate::ebpf_loader::if_index(&dst.phy_name()).unwrap_or(0) as u32;
+        let (src_idx, dst_idx) = match (
+            crate::ebpf_loader::if_index(&src.phy_name()),
+            crate::ebpf_loader::if_index(&dst.phy_name()),
+        ) {
+            (Some(s), Some(d)) => (s as u32, d as u32),
+            // 接口未解析（如不存在）时跳过该策略，避免 0 被当成"任意接口"通配：
+            // 对 DROP 策略意味着整机放行失败，属高危静默错误。
+            _ => {
+                warn!(
+                    "zone policy {}/{} skipped: cannot resolve ifindex for {} or {}",
+                    z.src_interface,
+                    z.dst_interface,
+                    src.phy_name(),
+                    dst.phy_name()
+                );
+                continue;
+            }
+        };
         out.push(ZoneEntry::from_ipv4(src_idx, dst_net, dst_prefix as u8, action));
         out.push(ZoneEntry::from_ipv4(dst_idx, src_net, src_prefix as u8, action));
     }
@@ -3729,8 +3771,9 @@ fn router(state: Arc<AppState>, strict_auth: bool) -> Router {
 pub async fn serve(path: &Path, state: Arc<AppState>) -> Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
-    // 让非 root 用户也能通过 CLI 连接（仅本机 Unix socket）
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+    // 控制 socket 仅限本机特权用户（root）访问：管理接口不接受未授权本地接管。
+    // 非 root 用户改用已认证的 HTTP API（需配置 daemon.api_keys 并携带密钥）。
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 
     info!("API listening on {}", path.display());
     axum::serve(listener, router(state, false)).await?;
