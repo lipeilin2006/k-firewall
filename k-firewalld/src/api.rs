@@ -933,13 +933,20 @@ async fn docs() -> axum::response::Html<String> {
 /// - `Authorization: Bearer <key>`
 /// - `X-API-Key: <key>`
 ///
-/// 未配置 `daemon.api_keys` 时跳过认证（保持向后兼容）；配置后所有 `/api/v1` 请求必须通过。
+/// 认证语义由 `strict` 决定：
+/// - `strict = false`（Unix socket，本机 CLI）：未配置 `daemon.api_keys` 时放行（保持兼容）。
+/// - `strict = true`（TCP/HTTP，默认 0.0.0.0）：`api_keys` 为空时**拒绝所有请求**
+///   （fail-closed），避免未配置密钥即把管理接口暴露到网络。
 pub async fn require_api_key(
     State(state): State<Arc<AppState>>,
+    strict: bool,
     req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
     if state.api_keys.is_empty() {
+        if strict {
+            return Err(ApiError::unauthorized());
+        }
         return Ok(next.run(req).await);
     }
     let provided = req
@@ -955,9 +962,23 @@ pub async fn require_api_key(
                 .map(str::to_owned)
         });
     match provided {
-        Some(key) if state.api_keys.iter().any(|k| k == &key) => Ok(next.run(req).await),
+        Some(key) if state.api_keys.iter().any(|k| ct_eq(k.as_bytes(), key.as_bytes())) => {
+            Ok(next.run(req).await)
+        }
         _ => Err(ApiError::unauthorized()),
     }
+}
+
+/// 恒定时间字符串比较，避免通过响应时间差逐字节猜测 API Key。
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// GET /api/v1/auth/verify：返回当前认证状态（配合中间件使用，未通过不会到达这里）。
@@ -1402,8 +1423,12 @@ async fn post_system_config(
     let body = String::from_utf8_lossy(&body).to_string();
     let cfg = Config::from_str(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let _ = cfg;
-    std::fs::write(path, &body)
-        .map_err(|e| ApiError::internal(format!("failed to write {}: {e}", path.display())))?;
+    // 原子写：先写同目录临时文件再 rename，避免写入中途崩溃留下截断/半写的配置。
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, &body)
+        .map_err(|e| ApiError::internal(format!("failed to write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| ApiError::internal(format!("failed to replace {}: {e}", path.display())))?;
     info!("config restored via API to {}", path.display());
     Ok(Json(ConfigRestoreOut {
         accepted: true,
@@ -1446,8 +1471,8 @@ async fn post_system_config_diff(
     let mut summary = Vec::new();
     if let Some(path) = &s.config_path {
         if let Ok(cur) = std::fs::read_to_string(path) {
-            let cur: serde_yaml::Value = serde_yaml::from_str(&cur).unwrap_or_default();
-            let new: serde_yaml::Value = serde_yaml::from_str(&text).unwrap_or_default();
+            let cur: serde_yaml_ng::Value = serde_yaml_ng::from_str(&cur).unwrap_or_default();
+            let new: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap_or_default();
             if let (Some(cmap), Some(nmap)) = (cur.as_mapping(), new.as_mapping()) {
                 let mut keys: Vec<&str> = Vec::new();
                 for k in nmap.keys() {
@@ -1464,8 +1489,8 @@ async fn post_system_config_diff(
                 }
                 keys.sort_unstable();
                 for k in keys {
-                    let cv = cmap.get(k).cloned().unwrap_or(serde_yaml::Value::Null);
-                    let nv = nmap.get(k).cloned().unwrap_or(serde_yaml::Value::Null);
+                    let cv = cmap.get(k).cloned().unwrap_or(serde_yaml_ng::Value::Null);
+                    let nv = nmap.get(k).cloned().unwrap_or(serde_yaml_ng::Value::Null);
                     if cv != nv {
                         changed_keys.push(k.to_string());
                         summary.push(format!("{k}: changed"));
@@ -1753,7 +1778,16 @@ async fn delete_qos_classes(
     })))
 }
 
-fn router(state: Arc<AppState>) -> Router {
+fn router(state: Arc<AppState>, strict_auth: bool) -> Router {
+    // 所有端点（含扁平兼容路由）都必须携带 API Key。`strict_auth` 控制
+    // `api_keys` 为空时的行为：HTTP 服务强制拒绝（fail-closed），Unix socket
+    // 本机 CLI 保持放行。
+    let require_key = middleware::from_fn_with_state(
+        state.clone(),
+        move |State(s): State<Arc<AppState>>, req: Request, next: Next| {
+            require_api_key(State(s), strict_auth, req, next)
+        },
+    );
     // /api/v1：所有端点都必须携带 API Key（`Authorization: Bearer <key>` 或 `X-API-Key: <key>`）。
     let api_v1 = Router::new()
         .route("/auth/verify", get(auth_verify))
@@ -1801,24 +1835,29 @@ fn router(state: Arc<AppState>) -> Router {
                 .delete(delete_qos_class),
         )
         .route("/qos/classes", delete(delete_qos_classes))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_key,
-        ))
+        .layer(require_key.clone())
         // 统一响应信封最外层：包裹成功/失败响应为 {code, message, data}。
         .layer(middleware::from_fn(wrap_envelope));
 
-    Router::new()
-        .nest("/api/v1", api_v1)
-        // 兼容的扁平路由（无认证；建议新客户端使用 /api/v1）。
+    // 兼容的扁平路由：同样要求认证；/openapi.json 与 /docs 为只读文档，
+    // 不涉及状态修改，允许匿名访问。
+    let flat = Router::new()
         .route("/status", get(status))
         .route("/stats", get(get_stats))
         .route("/blocked", get(get_blocked))
         .route("/block", post(block))
         .route("/unblock", post(unblock))
         .route("/metrics", get(metrics))
+        .layer(require_key);
+
+    let public = Router::new()
         .route("/openapi.json", get(openapi_json))
-        .route("/docs", get(docs))
+        .route("/docs", get(docs));
+
+    Router::new()
+        .nest("/api/v1", api_v1)
+        .merge(flat)
+        .merge(public)
         .with_state(state)
 }
 
@@ -1830,7 +1869,7 @@ pub async fn serve(path: &Path, state: Arc<AppState>) -> Result<()> {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
 
     info!("API listening on {}", path.display());
-    axum::serve(listener, router(state)).await?;
+    axum::serve(listener, router(state, false)).await?;
     Ok(())
 }
 
@@ -1840,7 +1879,8 @@ pub async fn serve_http(addr: &str, state: Arc<AppState>) -> Result<()> {
         .await
         .with_context(|| format!("bind {}", addr))?;
     info!("HTTP API listening on {}", addr);
-    axum::serve(listener, router(state)).await?;
+    // HTTP 暴露到网络：api_keys 未配置时拒绝所有请求（fail-closed）。
+    axum::serve(listener, router(state, true)).await?;
     Ok(())
 }
 

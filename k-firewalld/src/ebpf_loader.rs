@@ -794,6 +794,14 @@ impl EbpfHandle {
         tuples: &crate::suricata_rules::SuriTuples,
         prefilter: bool,
     ) -> Result<()> {
+        // 原子重同步：先关闭预过滤开关，再清空/重写 4 张规则表，最后按新状态
+        // 恢复开关，避免重写窗口内新建流命中半新半旧的表产生误放/误丢。
+        let mut config_map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
+        )?;
+        config_map.set(CONFIG_SURICATA_PREFILTER, 0, 0)?;
         clear_lpm(&mut self.suricata_rules_dst);
         clear_lpm(&mut self.suricata_rules_dst_any);
         clear_lpm(&mut self.suricata_rules_src);
@@ -811,11 +819,6 @@ impl EbpfHandle {
             self.suricata_rules_src_any.insert(k, 1, 0)?;
         }
         let enabled = prefilter && !tuples.is_empty();
-        let mut config_map: Array<_, u32> = Array::try_from(
-            self.ebpf
-                .map_mut("CONFIG")
-                .context("CONFIG map not found")?,
-        )?;
         config_map.set(CONFIG_SURICATA_PREFILTER, if enabled { 1 } else { 0 }, 0)?;
         info!(
             "SURICATA_RULES synced: {} tuples (dst={} dst_any={} src={} src_any={}), prefilter={}",
@@ -834,7 +837,15 @@ impl EbpfHandle {
     /// 复用，由 eBPF 侧 `apply_qos` 以 count 为界访问，无需显式清零。
     pub fn sync_qos_classes(&mut self, entries: &[QosConfig]) -> Result<()> {
         let count = entries.len().min(k_firewall_common::maps::QOS_MAX as usize);
-        // 先清空整张表（写入零值），避免残留旧条目被 eBPF 遍历。
+        // 原子重同步：先停用遍历（COUNT=0），避免 eBPF 在清空/写入期间读到
+        // 半新半旧的分类条目造成错误限速；全部写完后恢复 COUNT。
+        let mut config_map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
+        )?;
+        config_map.set(CONFIG_QOS_COUNT, 0, 0)?;
+        // 再清空整张表（写入零值），避免残留旧条目被 eBPF 遍历。
         let zero = QosConfig {
             ingress_ifindex: 0,
             proto: 0,
@@ -852,11 +863,6 @@ impl EbpfHandle {
         for (i, entry) in entries.iter().enumerate().take(count) {
             self.qos_classes.set(i as u32, *entry, 0)?;
         }
-        let mut config_map: Array<_, u32> = Array::try_from(
-            self.ebpf
-                .map_mut("CONFIG")
-                .context("CONFIG map not found")?,
-        )?;
         config_map.set(CONFIG_QOS_COUNT, count as u32, 0)?;
         info!(
             "QOS synced: {} classes (max {}), CONFIG_QOS_COUNT={}",

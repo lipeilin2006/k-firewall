@@ -141,7 +141,7 @@ impl Config {
 
     /// 从 YAML 字符串解析并校验配置（`POST /api/v1/system/config` 恢复用）。
     pub fn from_str(text: &str) -> Result<Self> {
-        let cfg: Config = serde_yaml::from_str(text).context("failed to parse config")?;
+        let cfg: Config = serde_yaml_ng::from_str(text).context("failed to parse config")?;
         cfg.validate()?;
         Ok(cfg)
     }

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::net::Ipv6Addr;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Mutex;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -173,7 +173,11 @@ impl IfaceServer {
 
     /// 分配一个当前未被占用的池内地址。
     fn alloc_addr(&self, now: std::time::Instant) -> Ipv6Addr {
-        let guard = self.leases.lock().unwrap();
+        self.alloc_addr_locked(&mut self.leases.lock().unwrap(), now)
+    }
+
+    /// 分配地址（调用方必须已持有 `leases` 锁，避免 `alloc_for` 二次加锁死锁）。
+    fn alloc_addr_locked(&self, guard: &mut HashMap<(Vec<u8>, u32), Lease>, now: std::time::Instant) -> Ipv6Addr {
         let mut offset = *self.next_offset.lock().unwrap();
         // 扫描上限：池远大于实际租约数，碰到已占用就线性探测，最多扫 4096 次。
         let scan_limit = self.host_count.min(4096);
@@ -308,9 +312,34 @@ async fn run_server(server: IfaceServer) {
 
 /// 创建绑定到指定网卡的 UDP 547 套接字并加入多播组。
 fn bind_iface_socket(server: &IfaceServer) -> Result<tokio::net::UdpSocket> {
-    let sock = std::net::UdpSocket::bind(("::", 547)).context("bind [::]:547")?;
-    let fd = sock.as_raw_fd();
-    // IPV6_V6ONLY：只收 IPv6（std 无 set_only_v6，用 libc）。
+    // 多接口同时监听 547：所有套接字必须先开 SO_REUSEADDR + SO_REUSEPORT，
+    // 否则第二个接口的 bind([::]:547) 会因地址占用失败。内核按
+    // SO_BINDTODEVICE 过滤，保证各套接字只收到本接口流量。
+    // 选项必须在 bind 前设置，因此用 libc 原生创建 socket。
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_UDP) };
+    if fd < 0 {
+        bail!("socket(AF_INET6): {}", std::io::Error::last_os_error());
+    }
+    for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+        let on: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                (&on as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            warn!(
+                "DHCPv6 {:?}: setsockopt({opt}) failed: {}",
+                server.name,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    // IPV6_V6ONLY：只收 IPv6（多播/双栈只监 IPv6，避免占用 IPv4 547）。
     let on: libc::c_int = 1;
     let ret = unsafe {
         libc::setsockopt(
@@ -328,6 +357,25 @@ fn bind_iface_socket(server: &IfaceServer) -> Result<tokio::net::UdpSocket> {
             std::io::Error::last_os_error()
         );
     }
+    // bind [::]:547。
+    let addr6 = libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: 547u16.to_be(),
+        sin6_flowinfo: 0,
+        sin6_addr: libc::in6_addr { s6_addr: [0; 16] },
+        sin6_scope_id: 0,
+    };
+    let ret = unsafe {
+        libc::bind(
+            fd,
+            (&addr6 as *const libc::sockaddr_in6).cast(),
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        bail!("bind [::]:547: {}", std::io::Error::last_os_error());
+    }
+    let sock = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
     sock.join_multicast_v6(&ALL_DHCP_RELAY_AGENTS_AND_SERVERS, server.ifindex)?;
     sock.set_multicast_loop_v6(false)?;
     // IPV6_MULTICAST_HOPS：std 无 set_multicast_hops_v6，用 libc。
@@ -394,8 +442,11 @@ fn handle_message(server: &IfaceServer, data: &[u8]) -> Result<Option<Vec<u8>>> 
         _ => 0,
     };
 
-    // 请求的 IAADDR（若有，用于续租校验）。
+    // 请求的 IAADDR（若有，用于续租校验）。IA_NA 载荷 <12 字节时不解析内嵌 IAADDR。
     let requested_addr = ia_na.as_ref().and_then(|(_, d)| {
+        if d.len() < 12 {
+            return None;
+        }
         // IA_NA 内嵌 IAADDR：跳过 IAID(4)+T1(4)+T2(4)。
         parse_options(&d[12..])
             .iter()
@@ -537,13 +588,15 @@ fn in_pool(server: &IfaceServer, addr: Ipv6Addr) -> bool {
 fn alloc_for(server: &IfaceServer, duid: &[u8], iaid: u32) -> Ipv6Addr {
     let now = std::time::Instant::now();
     let mut guard = server.leases.lock().unwrap();
+    // 惰性清理过期租约（每次分配最多扫描清 16 条，防止长尾客户端占用内存）。
+    prune_expired_locked(&mut guard, now, 16);
     if let Some(l) = guard.get(&(duid.to_vec(), iaid)) {
         if l.valid_until > now {
             return l.addr;
         }
         guard.remove(&(duid.to_vec(), iaid));
     }
-    let addr = server.alloc_addr(now);
+    let addr = server.alloc_addr_locked(&mut guard, now);
     if addr == Ipv6Addr::UNSPECIFIED {
         return addr;
     }
@@ -555,4 +608,24 @@ fn alloc_for(server: &IfaceServer, duid: &[u8], iaid: u32) -> Ipv6Addr {
         },
     );
     addr
+}
+
+/// 从租约表中移除已过期的条目（最多清理 `limit` 条，限制单次遍历开销）。
+fn prune_expired_locked(
+    leases: &mut std::sync::MutexGuard<'_, HashMap<(Vec<u8>, u32), Lease>>,
+    now: std::time::Instant,
+    limit: usize,
+) {
+    let mut expired: Vec<(Vec<u8>, u32)> = Vec::new();
+    for (k, l) in leases.iter() {
+        if l.valid_until <= now {
+            expired.push(k.clone());
+            if expired.len() >= limit {
+                break;
+            }
+        }
+    }
+    for k in expired {
+        leases.remove(&k);
+    }
 }

@@ -19,7 +19,7 @@ rusqlite = { workspace = true }
 scalar_api_reference = { workspace = true }
 serde = { workspace = true, default-features = true }
 serde_json = { workspace = true, default-features = true }
-serde_yaml = { workspace = true, default-features = true }
+serde_yaml_ng = { workspace = true, default-features = true }
 suricatax-rule-parser = "0.2.0-alpha.1"
 tokio = { workspace = true, features = [
     "macros",

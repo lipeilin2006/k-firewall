@@ -31,7 +31,7 @@ futures-util = { version = "0.3", default-features = false }
 libc = { version = "0.2.159", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = { version = "1", default-features = false }
-serde_yaml = { version = "0.9" }
+serde_yaml_ng = { version = "0.9" }
 tokio = { version = "1.40.0", default-features = false }
 tokio-stream = { version = "0.1", default-features = false }
 tracing = { version = "0.1", default-features = false }

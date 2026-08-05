@@ -534,13 +534,22 @@ fn ct_tcp_step(flags: u8, reply: bool, cur: u8) -> u8 {
         return CT_STATE_TCP_TIME_WAIT;
     }
     if flags & TCPHDR_SYN != 0 {
-        if reply && (flags & TCPHDR_ACK != 0) {
-            return CT_STATE_TCP_ESTABLISHED;
+        // 已建立/关闭状态的连接收到 SYN（重传、孤儿或握手完成后的迟到 SYN）
+        // 不应降级回半开状态，否则会造成状态机回退。
+        let established = matches!(
+            cur,
+            CT_STATE_TCP_ESTABLISHED | CT_STATE_TCP_FIN_WAIT | CT_STATE_TCP_TIME_WAIT
+        );
+        if !established {
+            if reply && (flags & TCPHDR_ACK != 0) {
+                return CT_STATE_TCP_ESTABLISHED;
+            }
+            if reply {
+                return CT_STATE_TCP_SYN_RECV;
+            }
+            return CT_STATE_TCP_SYN_SENT;
         }
-        if reply {
-            return CT_STATE_TCP_SYN_RECV;
-        }
-        return CT_STATE_TCP_SYN_SENT;
+        return cur;
     }
     if flags & TCPHDR_ACK != 0 {
         if cur == CT_STATE_TCP_SYN_SENT || cur == CT_STATE_TCP_SYN_RECV {
@@ -920,7 +929,10 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         let dst_addr = unsafe { (*ipv4hdr).dst_addr };
         let proto = unsafe { (*ipv4hdr).proto };
         let iphdr_len = (((unsafe { (*ipv4hdr).vihl }) & 0x0F) as usize) * 4;
-        let (sp, dp) = read_ports(&ctx, l3_off + iphdr_len, proto)?;
+        // IHL < 5（20 字节）为畸形头：按 deny 语义丢弃而非放行。
+        if iphdr_len < 20 {
+            return Ok(xdp_action::XDP_DROP);
+        }
         // 分片：MF 标志（frag_flags & 0x1）或非零偏移。
         let frag_flags = unsafe { (*ipv4hdr).frag_flags() };
         let frag_offset = unsafe { (*ipv4hdr).frag_offset() };
@@ -933,6 +945,14 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
             1
         } else {
             0
+        };
+        // 非首片分片载荷区无 L4 头，读端口失败是常态：端口置 0，交由
+        // `handle_fragments` 依据分片策略终决（DROP/INSPECT），避免畸形非首片
+        // 借 read_ports 失败 fail-open 绕过分片策略。
+        let (sp, dp) = if is_fragmented != 0 && frag_offset != 0 {
+            (0, 0)
+        } else {
+            read_ports(&ctx, l3_off + iphdr_len, proto)?
         };
         (
             u32::from_be_bytes(src_addr),
@@ -954,13 +974,15 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         let mut l4_off = l3_off + Ipv6Hdr::LEN;
         let mut is_fragmented: u8 = 0;
         let mut is_first: u8 = 0;
+        let mut frag_offset: u16 = 0;
         // 有界遍历扩展头（跳变式长度字段），最多 8 个。
         let mut remaining = 5;
         loop {
             match proto {
                 IPPROTO_HOPOPTS | IPPROTO_ROUTING | IPPROTO_DSTOPTS => {
                     if remaining == 0 {
-                        return Err(());
+                        // 扩展头过多：畸形包，按 deny 语义丢弃而非放行。
+                        return Ok(xdp_action::XDP_DROP);
                     }
                     remaining -= 1;
                     let hdr: *const [u8; 2] = unsafe { ptr_at(&ctx, l4_off)? };
@@ -968,14 +990,14 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                     let ext_len = unsafe { (*hdr)[1] };
                     proto = next;
                     l4_off += ((ext_len as usize) + 1) * 8;
-                    // 钳制扩展头长度：畸形包返回 Err，避免 verifier 值域膨胀。
+                    // 钳制扩展头长度：畸形包返回 DROP，避免 verifier 值域膨胀。
                     if l4_off > MAX_L4_OFF {
-                        return Err(());
+                        return Ok(xdp_action::XDP_DROP);
                     }
                 }
                 IPPROTO_FRAGMENT => {
                     if remaining == 0 {
-                        return Err(());
+                        return Ok(xdp_action::XDP_DROP);
                     }
                     remaining -= 1;
                     let next = unsafe { *ptr_at::<u8>(&ctx, l4_off)? };
@@ -988,9 +1010,10 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                     proto = next;
                     l4_off += 8;
                     if l4_off > MAX_L4_OFF {
-                        return Err(());
+                        return Ok(xdp_action::XDP_DROP);
                     }
                     is_fragmented = 1;
+                    frag_offset = offset;
                     // 首片 = 偏移 0（携带 L4 头起始）。
                     if offset == 0 {
                         is_first = 1;
@@ -998,7 +1021,7 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                 }
                 IPPROTO_AH => {
                     if remaining == 0 {
-                        return Err(());
+                        return Ok(xdp_action::XDP_DROP);
                     }
                     remaining -= 1;
                     let hdr: *const [u8; 2] = unsafe { ptr_at(&ctx, l4_off)? };
@@ -1007,13 +1030,18 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                     proto = next;
                     l4_off += ((payload_len as usize) + 2) * 4;
                     if l4_off > MAX_L4_OFF {
-                        return Err(());
+                        return Ok(xdp_action::XDP_DROP);
                     }
                 }
                 _ => break,
             }
         }
-        let (sp, dp) = read_ports(&ctx, l4_off, proto)?;
+        // 非首片分片无 L4 头：端口置 0，交由分片策略终决。
+        let (sp, dp) = if is_fragmented != 0 && frag_offset != 0 {
+            (0, 0)
+        } else {
+            read_ports(&ctx, l4_off, proto)?
+        };
         (
             u32::from_be_bytes([src_addr[0], src_addr[1], src_addr[2], src_addr[3]]),
             u32::from_be_bytes([dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]]),
@@ -1114,10 +1142,18 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
     };
     let rev_key = flow_key.reverse();
     if unsafe { SURICATA_ALLOW_MAP.get(&flow_key).is_some() } {
+        let now = unsafe { bpf_ktime_get_ns() };
+        if frag.is_fragmented != 0 {
+            frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
+        }
         bump_stats(true, false);
         return Ok(xdp_action::XDP_PASS);
     }
     if unsafe { SURICATA_ALLOW_MAP.get(&rev_key).is_some() } {
+        let now = unsafe { bpf_ktime_get_ns() };
+        if frag.is_fragmented != 0 {
+            frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
+        }
         bump_stats(true, false);
         return Ok(xdp_action::XDP_PASS);
     }
@@ -1131,6 +1167,10 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         unsafe { LOCAL_IPS.get(&key).is_some() }
     };
     if local_hit {
+        let now = unsafe { bpf_ktime_get_ns() };
+        if frag.is_fragmented != 0 {
+            frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
+        }
         bump_stats(true, false);
         return Ok(xdp_action::XDP_PASS);
     }
@@ -1225,15 +1265,6 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                 frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
             }
             let _ = CONNTRACK.insert(&rev_key, &nv, 0);
-            info!(
-                &ctx,
-                "CT family={} proto={} sport={} dport={} state={} (reply)",
-                if is_ipv4 { 4 } else { 6 },
-                proto,
-                src_port,
-                dst_port,
-                new_state
-            );
             bump_stats(true, false);
             return Ok(xdp_action::XDP_PASS);
         }
@@ -1256,6 +1287,9 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                     &ctx,
                     "DNAT dport={} to={:i}:{} reply_to={:i}", dst_port, to_ip, to_port, src_ip
                 );
+            }
+            if frag.is_fragmented != 0 {
+                frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
             }
             bump_stats(true, false);
             return Ok(xdp_action::XDP_PASS);
@@ -1296,6 +1330,9 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                     dst_port,
                     initial
                 );
+            }
+            if frag.is_fragmented != 0 {
+                frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
             }
             bump_stats(true, false);
             info!(
@@ -1372,6 +1409,10 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
             return Ok(xdp_action::XDP_DROP);
         }
         Some(k_firewall_common::ACTION_PASS) => {
+            let now = unsafe { bpf_ktime_get_ns() };
+            if frag.is_fragmented != 0 {
+                frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
+            }
             bump_stats(true, false);
             return Ok(xdp_action::XDP_PASS);
         }
@@ -1581,12 +1622,7 @@ pub fn kfw_tc_egress(ctx: TcContext) -> i32 {
         let now = unsafe { bpf_ktime_get_ns() };
         let mut nv = CtValue::nat_reply();
         nv.last_seen = now;
-        if CONNTRACK.insert(&reply_key, &nv, 0).is_ok() {
-            info!(
-                &ctx,
-                "TC NAT LEARN family=4 reply_src={:i} reply_dport={}", dst_ip, sp
-            );
-        }
+        let _ = CONNTRACK.insert(&reply_key, &nv, 0);
         bindings::TC_ACT_OK
     } else if ether_type == EtherType::Ipv6 as u16 {
         let proto: u8 = match ctx.load(l3_off + 6) {
@@ -1606,9 +1642,7 @@ pub fn kfw_tc_egress(ctx: TcContext) -> i32 {
         let now = unsafe { bpf_ktime_get_ns() };
         let mut nv = CtValue::nat_reply();
         nv.last_seen = now;
-        if CONNTRACK.insert(&reply_key, &nv, 0).is_ok() {
-            info!(&ctx, "TC NAT LEARN family=6 proto={}", proto);
-        }
+        let _ = CONNTRACK.insert(&reply_key, &nv, 0);
         bindings::TC_ACT_OK
     } else {
         bindings::TC_ACT_OK
