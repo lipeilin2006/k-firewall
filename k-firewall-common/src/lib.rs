@@ -36,6 +36,12 @@ pub const CONFIG_FTP_ALG: u32 = 8;
 /// 开启后 XDP 对新建流按 `SURICATA_RULES`（LPM）做准入：未命中任一 Suricata
 /// 规则头部的流直接丢弃（线速预过滤，只有需要 DPI 的流到达 Suricata）。
 pub const CONFIG_SURICATA_PREFILTER: u32 = 9;
+/// `CONFIG` map 槽位：启用中的 Zone 策略条目数（`ZONE` 数组遍历上界）。
+///
+/// `ZONE` 按条目数组顺序执行，首条命中的策略生效（数组下标即执行顺序，
+/// 由 daemon 依据策略 id 升序写入）。`CONFIG_SURICATA_PREFILTER` 之后新增，
+/// 需同步扩大 eBPF `CONFIG` 数组容量。
+pub const CONFIG_ZONE_COUNT: u32 = 10;
 
 /// `BLOCKED` map 的 value 占位标记。
 pub const BLOCKED_MARKER: u64 = 1;
@@ -555,6 +561,251 @@ pub mod api {
     /// DELETE /api/v1/qos/classes：按 id 批量删除。
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct QosClassDeleteRequest {
+        pub ids: Vec<u64>,
+    }
+
+    // ==========================================================================
+    // 安全规则（WebAPI 管理）——`/api/v1/security`
+    // ==========================================================================
+
+    /// 单个源 IP 速率限制规则（输出）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RateLimitOut {
+        pub id: u64,
+        /// 源地址（IPv4 / IPv6）。
+        pub src_ip: String,
+        /// 每秒令牌数（pps）。
+        pub rate: u32,
+        /// 桶容量（突发包数）。
+        pub burst: u32,
+        /// 是否启用。
+        pub enabled: bool,
+    }
+
+    /// POST /api/v1/security/rate-limits：新增（`id` 可自定；缺省自动分配）。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct RateLimitRequest {
+        /// 可选自定义 id；缺省/为 0 时自动分配（max+1）。
+        #[serde(default)]
+        pub id: Option<u64>,
+        pub src_ip: String,
+        pub rate: u32,
+        #[serde(default = "default_burst_1000")]
+        pub burst: u32,
+    }
+
+    /// PUT /api/v1/security/rate-limits/{id}：原地替换。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct RateLimitUpdateRequest {
+        pub src_ip: String,
+        pub rate: u32,
+        #[serde(default = "default_burst_1000")]
+        pub burst: u32,
+    }
+
+    /// GET /api/v1/security/rate-limits 结果。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RateLimitListOut {
+        pub total: usize,
+        pub entries: Vec<RateLimitOut>,
+    }
+
+    /// 交换两个规则的执行顺序（调整 id 即调整顺序）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct OrderSwapRequest {
+        pub id_a: u64,
+        pub id_b: u64,
+    }
+
+    /// DELETE /api/v1/security/rate-limits：按 id 批量删除。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RateLimitDeleteRequest {
+        pub ids: Vec<u64>,
+    }
+
+    /// 单个每源并发连接数限制规则（输出）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ConnLimitOut {
+        pub id: u64,
+        /// 源地址（IPv4 / IPv6）。
+        pub src_ip: String,
+        /// 允许的最大并发连接数。
+        pub max_conns: u32,
+        /// 是否启用。
+        pub enabled: bool,
+    }
+
+    /// POST /api/v1/security/conn-limits：新增（`id` 可自定）。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct ConnLimitRequest {
+        /// 可选自定义 id；缺省/为 0 时自动分配。
+        #[serde(default)]
+        pub id: Option<u64>,
+        pub src_ip: String,
+        pub max_conns: u32,
+    }
+
+    /// PUT /api/v1/security/conn-limits/{id}：原地替换。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct ConnLimitUpdateRequest {
+        pub src_ip: String,
+        pub max_conns: u32,
+    }
+
+    /// GET /api/v1/security/conn-limits 结果。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ConnLimitListOut {
+        pub total: usize,
+        pub entries: Vec<ConnLimitOut>,
+    }
+
+    /// DELETE /api/v1/security/conn-limits：按 id 批量删除。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ConnLimitDeleteRequest {
+        pub ids: Vec<u64>,
+    }
+
+    /// SYN Flood 防护全局配置（输出）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SynFloodOut {
+        /// 每源 IP 新建连接（SYN）速率上限（pps）；0 = 关闭。
+        pub rate_pps: u32,
+        /// 令牌桶突发容量。
+        pub burst: u32,
+        /// 每源 IP 半开连接数上限；0 = 关闭。
+        pub max_half_open: u32,
+    }
+
+    /// PUT /api/v1/security/syn-flood：整体替换。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct SynFloodRequest {
+        #[serde(default)]
+        pub rate_pps: u32,
+        #[serde(default = "default_burst_100")]
+        pub burst: u32,
+        #[serde(default)]
+        pub max_half_open: u32,
+    }
+
+    fn default_burst_1000() -> u32 {
+        1000
+    }
+
+    fn default_burst_100() -> u32 {
+        100
+    }
+
+    // ==========================================================================
+    // NAT 端口转发规则（WebAPI 管理）——`/api/v1/nat/rules`
+    // ==========================================================================
+
+    /// 单个 DNAT 端口转发规则（输出）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NatRuleOut {
+        pub id: u64,
+        /// 公网（WAN）目的 IP（IPv4）。
+        pub dst_ip: String,
+        /// 公网目的端口。
+        pub dst_port: u16,
+        /// tcp | udp。
+        pub proto: String,
+        /// 内部服务器 IP。
+        pub to_ip: String,
+        /// 内部服务器端口。
+        pub to_port: u16,
+        /// 是否启用。
+        pub enabled: bool,
+    }
+
+    /// POST /api/v1/nat/rules：新增（`id` 可自定）。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct NatRuleRequest {
+        /// 可选自定义 id；缺省/为 0 时自动分配。
+        #[serde(default)]
+        pub id: Option<u64>,
+        pub dst_ip: String,
+        pub dst_port: u16,
+        #[serde(default = "default_proto_tcp")]
+        pub proto: String,
+        pub to_ip: String,
+        pub to_port: u16,
+    }
+
+    /// PUT /api/v1/nat/rules/{id}：原地替换。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct NatRuleUpdateRequest {
+        pub dst_ip: String,
+        pub dst_port: u16,
+        #[serde(default = "default_proto_tcp")]
+        pub proto: String,
+        pub to_ip: String,
+        pub to_port: u16,
+    }
+
+    /// GET /api/v1/nat/rules 结果。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NatRuleListOut {
+        pub total: usize,
+        pub entries: Vec<NatRuleOut>,
+    }
+
+    /// DELETE /api/v1/nat/rules：按 id 批量删除。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NatRuleDeleteRequest {
+        pub ids: Vec<u64>,
+    }
+
+    fn default_proto_tcp() -> String {
+        "tcp".into()
+    }
+
+    // ==========================================================================
+    // Zone 策略（WebAPI 管理）——`/api/v1/zones`
+    // ==========================================================================
+
+    /// 单个 Zone 策略（输出）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ZonePolicyOut {
+        pub id: u64,
+        /// 源接口（逻辑名）。
+        pub src_interface: String,
+        /// 目的接口（逻辑名）。
+        pub dst_interface: String,
+        /// accept | drop。
+        pub action: String,
+        /// 是否启用。
+        pub enabled: bool,
+    }
+
+    /// POST /api/v1/zones：新增（`id` 可自定）。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct ZonePolicyRequest {
+        /// 可选自定义 id；缺省/为 0 时自动分配。
+        #[serde(default)]
+        pub id: Option<u64>,
+        pub src_interface: String,
+        pub dst_interface: String,
+        pub action: String,
+    }
+
+    /// PUT /api/v1/zones/{id}：原地替换。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct ZonePolicyUpdateRequest {
+        pub src_interface: String,
+        pub dst_interface: String,
+        pub action: String,
+    }
+
+    /// GET /api/v1/zones 结果。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ZonePolicyListOut {
+        pub total: usize,
+        pub entries: Vec<ZonePolicyOut>,
+    }
+
+    /// DELETE /api/v1/zones：按 id 批量删除。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ZonePolicyDeleteRequest {
         pub ids: Vec<u64>,
     }
 }

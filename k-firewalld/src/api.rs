@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,15 +16,21 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use k_firewall_common::BlockEntry;
+use k_firewall_common::maps::{DnatKey, DnatValue, IpKey, ZoneEntry};
 use k_firewall_common::api::{
     BlockRequest, BlockedEntryOut, BlockedOut, BlocklistEntryOut, BlocklistOut, ConfigDiffOut,
-    ConfigRestoreOut, ConfigValidateOut, Error, InterfaceInfo, InterfaceStats, InterfaceStatsOut,
-    InterfacesOut, QosClassDeleteRequest, QosClassListOut, QosClassOut, QosClassPatchRequest,
-    QosClassRequest, QosClassUpdateRequest, SessionDeleteRequest, SessionListQuery, SessionOut,
-    SessionsDeleteOut, SessionsOut, StatsOut, Status, SuricataPrefilterStats,
-    SuricataRuleDeleteRequest, SuricataRuleImportOut, SuricataRuleImportRequest,
-    SuricataRuleListOut, SuricataRuleOut, SuricataRulePatchRequest, SuricataRuleRequest,
-    SuricataRuleUpdateRequest,
+    ConfigRestoreOut, ConfigValidateOut, ConnLimitDeleteRequest, ConnLimitListOut, ConnLimitOut,
+    ConnLimitRequest, ConnLimitUpdateRequest, Error, InterfaceInfo, InterfaceStats,
+    InterfaceStatsOut, InterfacesOut, NatRuleDeleteRequest, NatRuleListOut, NatRuleOut,
+    NatRuleRequest, NatRuleUpdateRequest, OrderSwapRequest, QosClassDeleteRequest, QosClassListOut,
+    QosClassOut, QosClassPatchRequest, QosClassRequest, QosClassUpdateRequest,
+    RateLimitDeleteRequest, RateLimitListOut, RateLimitOut, RateLimitRequest, RateLimitUpdateRequest,
+    SessionDeleteRequest, SessionListQuery, SessionOut, SessionsDeleteOut, SessionsOut, StatsOut,
+    Status, SuricataPrefilterStats, SuricataRuleDeleteRequest, SuricataRuleImportOut,
+    SuricataRuleImportRequest, SuricataRuleListOut, SuricataRuleOut, SuricataRulePatchRequest,
+    SuricataRuleRequest, SuricataRuleUpdateRequest, SynFloodOut, SynFloodRequest,
+    ZonePolicyDeleteRequest, ZonePolicyListOut, ZonePolicyOut, ZonePolicyRequest,
+    ZonePolicyUpdateRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -56,6 +62,24 @@ pub struct AppState {
     pub qos_classes: Mutex<Vec<crate::persist::QosClassRow>>,
     /// 下一条 QoS 分类 id（无持久化时使用）。
     pub next_qos_class_id: AtomicU64,
+    /// 运行时源 IP 速率限制规则（SQLite 持久化，热同步 `RATE_LIMITS`）。
+    pub rate_limits: Mutex<Vec<crate::persist::RateLimitRow>>,
+    /// 下一条速率限制规则 id（无持久化时使用）。
+    pub next_rate_limit_id: AtomicU64,
+    /// 运行时每源并发连接数限制规则（SQLite 持久化，热同步 `CONN_LIMITS`）。
+    pub conn_limits: Mutex<Vec<crate::persist::ConnLimitRow>>,
+    /// 下一条并发连接数限制规则 id（无持久化时使用）。
+    pub next_conn_limit_id: AtomicU64,
+    /// 运行时 DNAT 端口转发规则（SQLite 持久化，热同步 `DNAT_RULES`）。
+    pub nat_rules: Mutex<Vec<crate::persist::NatRuleRow>>,
+    /// 下一条 DNAT 规则 id（无持久化时使用）。
+    pub next_nat_rule_id: AtomicU64,
+    /// 运行时 Zone 策略（SQLite 持久化，热同步 `ZONE`；id 顺序即执行顺序）。
+    pub zone_policies: Mutex<Vec<crate::persist::ZonePolicyRow>>,
+    /// 下一条 Zone 策略 id（无持久化时使用）。
+    pub next_zone_policy_id: AtomicU64,
+    /// 运行时 SYN Flood 防护配置（SQLite 持久化，热同步 `CONFIG_SYN_*`）。
+    pub syn_flood: Mutex<crate::persist::SynFloodRow>,
     /// `suricata.prefilter` 配置（XDP 规则头预过滤开关；可热改）。
     pub suricata_prefilter: AtomicBool,
     /// 运行时规则持久化（未配置 `daemon.db_path` 时为空）。
@@ -154,6 +178,197 @@ impl AppState {
             }
         }
 
+        // 运行时 NAT 端口转发规则：DB 为空时从配置播种（DB 为运行时事实源），再同步 eBPF。
+        let nat_rules = {
+            let mut rows = Vec::new();
+            if let Some(p) = &persist {
+                match p.load_nat_rules() {
+                    Ok(r) => rows = r,
+                    Err(e) => warn!("failed to load nat rules from db: {e:#}"),
+                }
+                if rows.is_empty() && !config.nat_rules.is_empty() {
+                    for d in &config.nat_rules {
+                        if let Err(e) = p.insert_nat_rule(&crate::persist::NatRuleRow {
+                            id: None,
+                            dst_ip: d.dst_ip,
+                            dst_port: d.dst_port,
+                            proto: d.proto.clone(),
+                            to_ip: d.to_ip,
+                            to_port: d.to_port,
+                            enabled: true,
+                        }) {
+                            warn!("failed to seed nat rule from config: {e:#}");
+                        }
+                    }
+                    match p.load_nat_rules() {
+                        Ok(r) => rows = r,
+                        Err(e) => warn!("failed to reload nat rules: {e:#}"),
+                    }
+                }
+            }
+            rows
+        };
+        let mut next_nat_rule_id = 1u64;
+        for r in &nat_rules {
+            if let Some(id) = r.id {
+                next_nat_rule_id = next_nat_rule_id.max(id as u64 + 1);
+            }
+        }
+        {
+            let entries = nat_entries_from_rows(&nat_rules, &config.interfaces);
+            if let Err(e) = handle.sync_dnat_rules(&entries) {
+                warn!("failed to sync nat rules to ebpf: {e:#}");
+            }
+        }
+
+        // 运行时源 IP 速率限制规则：DB 为空时从配置播种，再同步 eBPF。
+        let rate_limits = {
+            let mut rows = Vec::new();
+            if let Some(p) = &persist {
+                match p.load_rate_limits() {
+                    Ok(r) => rows = r,
+                    Err(e) => warn!("failed to load rate limits from db: {e:#}"),
+                }
+                if rows.is_empty() && !config.rate_limit_rules.is_empty() {
+                    for rl in &config.rate_limit_rules {
+                        if let Err(e) = p.insert_rate_limit(&crate::persist::RateLimitRow {
+                            id: None,
+                            src_ip: rl.src_ip,
+                            rate: rl.rate,
+                            burst: rl.burst,
+                            enabled: true,
+                        }) {
+                            warn!("failed to seed rate limit from config: {e:#}");
+                        }
+                    }
+                    match p.load_rate_limits() {
+                        Ok(r) => rows = r,
+                        Err(e) => warn!("failed to reload rate limits: {e:#}"),
+                    }
+                }
+            }
+            rows
+        };
+        let mut next_rate_limit_id = 1u64;
+        for r in &rate_limits {
+            if let Some(id) = r.id {
+                next_rate_limit_id = next_rate_limit_id.max(id as u64 + 1);
+            }
+        }
+        {
+            let entries = rate_entries_from_rows(&rate_limits);
+            if let Err(e) = handle.sync_rate_limit_entries(&entries) {
+                warn!("failed to sync rate limits to ebpf: {e:#}");
+            }
+        }
+
+        // 运行时每源并发连接数限制规则：DB 为空时从配置播种，再同步 eBPF。
+        let conn_limits = {
+            let mut rows = Vec::new();
+            if let Some(p) = &persist {
+                match p.load_conn_limits() {
+                    Ok(r) => rows = r,
+                    Err(e) => warn!("failed to load conn limits from db: {e:#}"),
+                }
+                if rows.is_empty() && !config.conn_limits.is_empty() {
+                    for cl in &config.conn_limits {
+                        if let Err(e) = p.insert_conn_limit(&crate::persist::ConnLimitRow {
+                            id: None,
+                            src_ip: cl.src_ip,
+                            max_conns: cl.max_conns,
+                            enabled: true,
+                        }) {
+                            warn!("failed to seed conn limit from config: {e:#}");
+                        }
+                    }
+                    match p.load_conn_limits() {
+                        Ok(r) => rows = r,
+                        Err(e) => warn!("failed to reload conn limits: {e:#}"),
+                    }
+                }
+            }
+            rows
+        };
+        let mut next_conn_limit_id = 1u64;
+        for r in &conn_limits {
+            if let Some(id) = r.id {
+                next_conn_limit_id = next_conn_limit_id.max(id as u64 + 1);
+            }
+        }
+        {
+            let entries = conn_entries_from_rows(&conn_limits);
+            if let Err(e) = handle.sync_conn_limits(&entries) {
+                warn!("failed to sync conn limits to ebpf: {e:#}");
+            }
+        }
+
+        // 运行时 Zone 策略：DB 为空时从配置播种，再同步 eBPF。
+        let zone_policies = {
+            let mut rows = Vec::new();
+            if let Some(p) = &persist {
+                match p.load_zone_policies() {
+                    Ok(r) => rows = r,
+                    Err(e) => warn!("failed to load zone policies from db: {e:#}"),
+                }
+                if rows.is_empty() && !config.zone_policies.is_empty() {
+                    for z in &config.zone_policies {
+                        if let Err(e) = p.insert_zone_policy(&crate::persist::ZonePolicyRow {
+                            id: None,
+                            src_interface: z.src_interface.clone(),
+                            dst_interface: z.dst_interface.clone(),
+                            action: z.action.clone(),
+                            enabled: true,
+                        }) {
+                            warn!("failed to seed zone policy from config: {e:#}");
+                        }
+                    }
+                    match p.load_zone_policies() {
+                        Ok(r) => rows = r,
+                        Err(e) => warn!("failed to reload zone policies: {e:#}"),
+                    }
+                }
+            }
+            rows
+        };
+        let mut next_zone_policy_id = 1u64;
+        for r in &zone_policies {
+            if let Some(id) = r.id {
+                next_zone_policy_id = next_zone_policy_id.max(id as u64 + 1);
+            }
+        }
+        {
+            let entries = zone_entries_from_rows(&zone_policies, &config.interfaces);
+            if let Err(e) = handle.sync_zone_policies(&entries) {
+                warn!("failed to sync zone policies to ebpf: {e:#}");
+            }
+        }
+
+        // 运行时 SYN Flood 防护配置：DB 无行时回退到配置默认，再同步 eBPF。
+        let syn_flood = {
+            let row = match &persist {
+                Some(p) => match p.load_syn_flood() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("failed to load syn_flood config from db: {e:#}");
+                        crate::persist::SynFloodRow {
+                            rate_pps: config.syn_flood.rate_pps,
+                            burst: config.syn_flood.burst,
+                            max_half_open: config.syn_flood.max_half_open,
+                        }
+                    }
+                },
+                None => crate::persist::SynFloodRow {
+                    rate_pps: config.syn_flood.rate_pps,
+                    burst: config.syn_flood.burst,
+                    max_half_open: config.syn_flood.max_half_open,
+                },
+            };
+            if let Err(e) = handle.sync_syn_flood(row.rate_pps, row.burst, row.max_half_open) {
+                warn!("failed to sync syn_flood config to ebpf: {e:#}");
+            }
+            row
+        };
+
         Ok(Self {
             handle: tokio::sync::Mutex::new(handle),
             blocked: Mutex::new(blocked),
@@ -162,6 +377,15 @@ impl AppState {
             next_suri_rule_id: AtomicU64::new(1),
             qos_classes: Mutex::new(qos_classes),
             next_qos_class_id: AtomicU64::new(next_qos_class_id),
+            rate_limits: Mutex::new(rate_limits),
+            next_rate_limit_id: AtomicU64::new(next_rate_limit_id),
+            conn_limits: Mutex::new(conn_limits),
+            next_conn_limit_id: AtomicU64::new(next_conn_limit_id),
+            nat_rules: Mutex::new(nat_rules),
+            next_nat_rule_id: AtomicU64::new(next_nat_rule_id),
+            zone_policies: Mutex::new(zone_policies),
+            next_zone_policy_id: AtomicU64::new(next_zone_policy_id),
+            syn_flood: Mutex::new(syn_flood),
             suricata_prefilter: AtomicBool::new(config.suricata.prefilter),
             persist,
             api_keys: config.daemon.api_keys.clone(),
@@ -667,6 +891,980 @@ impl AppState {
         }
         Ok(removed)
     }
+
+    // ---- 源 IP 速率限制（/security/rate-limits）----
+
+    /// 当前全部速率限制规则。
+    pub fn rate_limits_out(&self) -> Vec<RateLimitOut> {
+        self.rate_limits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(rate_limit_to_out)
+            .collect()
+    }
+
+    /// 重同步速率限制表（增删改/交换后调用）。
+    pub async fn resync_rate_limits(&self) -> Result<()> {
+        let entries = {
+            let list = self.rate_limits.lock().unwrap();
+            rate_entries_from_rows(&list)
+        };
+        let mut handle = self.handle.lock().await;
+        handle.sync_rate_limit_entries(&entries)
+    }
+
+    /// 新增一条速率限制规则（id 可自定）。校验 → 持久化 → 内存 → 热同步。
+    pub async fn add_rate_limit(&self, req: &RateLimitRequest) -> Result<RateLimitOut> {
+        let src_ip: IpAddr = req.src_ip.parse().map_err(|_| anyhow!("invalid src_ip"))?;
+        if req.rate == 0 {
+            anyhow::bail!("rate must be > 0");
+        }
+        if req.burst == 0 {
+            anyhow::bail!("burst must be > 0");
+        }
+        let (row, id) = {
+            let mut list = self.rate_limits.lock().unwrap();
+            if list.iter().any(|r| r.src_ip == src_ip) {
+                anyhow::bail!("rate limit for {src_ip} already exists");
+            }
+            let mut row = crate::persist::RateLimitRow {
+                id: None,
+                src_ip,
+                rate: req.rate,
+                burst: req.burst,
+                enabled: true,
+            };
+            let custom = match req.id {
+                Some(c) if c > 0 => {
+                    if list.iter().any(|r| r.id == Some(c as i64)) {
+                        anyhow::bail!("rate limit id {c} already in use");
+                    }
+                    c as i64
+                }
+                _ => 0,
+            };
+            if custom > 0 {
+                row.id = Some(custom);
+            }
+            let id = match &self.persist {
+                Some(p) => p.insert_rate_limit(&row)?,
+                None => {
+                    if custom > 0 {
+                        custom
+                    } else {
+                        self.next_rate_limit_id.fetch_add(1, Ordering::Relaxed) as i64
+                    }
+                }
+            };
+            row.id = Some(id);
+            list.push(row.clone());
+            self.next_rate_limit_id
+                .fetch_max(id as u64 + 1, Ordering::Relaxed);
+            (row, id)
+        };
+        self.resync_rate_limits().await?;
+        info!("rate limit added via API: id={id} src={}", row.src_ip);
+        Ok(rate_limit_to_out(&row))
+    }
+
+    /// 原地替换一条速率限制规则（PUT）。None = 不存在。
+    pub async fn update_rate_limit(
+        &self,
+        id: u64,
+        req: &RateLimitUpdateRequest,
+    ) -> Result<Option<RateLimitOut>> {
+        let src_ip: IpAddr = req.src_ip.parse().map_err(|_| anyhow!("invalid src_ip"))?;
+        if req.rate == 0 {
+            anyhow::bail!("rate must be > 0");
+        }
+        if req.burst == 0 {
+            anyhow::bail!("burst must be > 0");
+        }
+        let row = {
+            let mut list = self.rate_limits.lock().unwrap();
+            let idx = match list.iter().position(|r| r.id == Some(id as i64)) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            if list
+                .iter()
+                .enumerate()
+                .any(|(i, r)| i != idx && r.src_ip == src_ip)
+            {
+                anyhow::bail!("rate limit for {src_ip} already exists");
+            }
+            let row = crate::persist::RateLimitRow {
+                id: Some(id as i64),
+                src_ip,
+                rate: req.rate,
+                burst: req.burst,
+                enabled: list[idx].enabled,
+            };
+            if let Some(p) = &self.persist {
+                p.update_rate_limit(id as i64, &row)?;
+            }
+            list[idx] = row.clone();
+            row
+        };
+        self.resync_rate_limits().await?;
+        info!("rate limit updated via API: id={id}");
+        Ok(Some(rate_limit_to_out(&row)))
+    }
+
+    /// 部分更新一条速率限制规则（PATCH，启停）。None = 不存在。
+    pub async fn patch_rate_limit(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> Result<Option<RateLimitOut>> {
+        let exists = {
+            let list = self.rate_limits.lock().unwrap();
+            list.iter().any(|r| r.id == Some(id as i64))
+        };
+        if !exists {
+            return Ok(None);
+        }
+        if let Some(v) = enabled {
+            if let Some(p) = &self.persist {
+                p.patch_rate_limit(id as i64, v)?;
+            }
+            let mut list = self.rate_limits.lock().unwrap();
+            if let Some(r) = list.iter_mut().find(|r| r.id == Some(id as i64)) {
+                r.enabled = v;
+            }
+        }
+        self.resync_rate_limits().await?;
+        Ok(self
+            .rate_limits
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == Some(id as i64))
+            .map(rate_limit_to_out))
+    }
+
+    /// 删除一条速率限制规则（按 id）。
+    pub async fn delete_rate_limit(&self, id: u64) -> Result<bool> {
+        let removed = {
+            let mut list = self.rate_limits.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| r.id != Some(id as i64));
+            list.len() != before
+        };
+        if !removed {
+            return Ok(false);
+        }
+        if let Some(p) = &self.persist {
+            p.delete_rate_limit(id as i64)?;
+        }
+        self.resync_rate_limits().await?;
+        info!("rate limit deleted via API: id={id}");
+        Ok(true)
+    }
+
+    /// 批量删除速率限制规则，返回删除条数。
+    pub async fn delete_rate_limits(&self, ids: &[u64]) -> Result<usize> {
+        let removed = {
+            let mut list = self.rate_limits.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| !ids.contains(&(r.id.unwrap_or(0) as u64)));
+            before - list.len()
+        };
+        if removed > 0 {
+            let ids_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+            if let Some(p) = &self.persist {
+                for id in ids_i64 {
+                    p.delete_rate_limit(id)?;
+                }
+            }
+            self.resync_rate_limits().await?;
+        }
+        Ok(removed)
+    }
+
+    /// 交换两条速率限制规则的执行顺序（互换 DB 行 id 后全量重同步）。
+    pub async fn swap_rate_limits(
+        &self,
+        id_a: u64,
+        id_b: u64,
+    ) -> Result<Option<(RateLimitOut, RateLimitOut)>> {
+        if id_a == id_b {
+            return Ok(None);
+        }
+        match &self.persist {
+            Some(p) => {
+                if !p.swap_ids("rate_limit_rules", "id", id_a as i64, id_b as i64)? {
+                    return Ok(None);
+                }
+                *self.rate_limits.lock().unwrap() = p.load_rate_limits()?;
+            }
+            None => {
+                let mut list = self.rate_limits.lock().unwrap();
+                let mut ia = None;
+                let mut ib = None;
+                for (i, r) in list.iter().enumerate() {
+                    if r.id == Some(id_a as i64) {
+                        ia = Some(i);
+                    }
+                    if r.id == Some(id_b as i64) {
+                        ib = Some(i);
+                    }
+                }
+                let (i_a, i_b) = match (ia, ib) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Ok(None),
+                };
+                let tmp = list[i_a].id;
+                list[i_a].id = list[i_b].id;
+                list[i_b].id = tmp;
+            }
+        }
+        self.resync_rate_limits().await?;
+        let list = self.rate_limits.lock().unwrap();
+        let a = list.iter().find(|r| r.id == Some(id_a as i64));
+        let b = list.iter().find(|r| r.id == Some(id_b as i64));
+        match (a, b) {
+            (Some(a), Some(b)) => Ok(Some((rate_limit_to_out(a), rate_limit_to_out(b)))),
+            _ => Ok(None),
+        }
+    }
+
+    // ---- 每源并发连接数限制（/security/conn-limits）----
+
+    /// 当前全部并发连接数限制规则。
+    pub fn conn_limits_out(&self) -> Vec<ConnLimitOut> {
+        self.conn_limits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(conn_limit_to_out)
+            .collect()
+    }
+
+    /// 重同步并发连接数限制表。
+    pub async fn resync_conn_limits(&self) -> Result<()> {
+        let entries = {
+            let list = self.conn_limits.lock().unwrap();
+            conn_entries_from_rows(&list)
+        };
+        let mut handle = self.handle.lock().await;
+        handle.sync_conn_limits(&entries)
+    }
+
+    /// 新增一条并发连接数限制规则（id 可自定）。
+    pub async fn add_conn_limit(&self, req: &ConnLimitRequest) -> Result<ConnLimitOut> {
+        let src_ip: IpAddr = req.src_ip.parse().map_err(|_| anyhow!("invalid src_ip"))?;
+        if req.max_conns == 0 {
+            anyhow::bail!("max_conns must be > 0");
+        }
+        let (row, id) = {
+            let mut list = self.conn_limits.lock().unwrap();
+            if list.iter().any(|r| r.src_ip == src_ip) {
+                anyhow::bail!("conn limit for {src_ip} already exists");
+            }
+            let mut row = crate::persist::ConnLimitRow {
+                id: None,
+                src_ip,
+                max_conns: req.max_conns,
+                enabled: true,
+            };
+            let custom = match req.id {
+                Some(c) if c > 0 => {
+                    if list.iter().any(|r| r.id == Some(c as i64)) {
+                        anyhow::bail!("conn limit id {c} already in use");
+                    }
+                    c as i64
+                }
+                _ => 0,
+            };
+            if custom > 0 {
+                row.id = Some(custom);
+            }
+            let id = match &self.persist {
+                Some(p) => p.insert_conn_limit(&row)?,
+                None => {
+                    if custom > 0 {
+                        custom
+                    } else {
+                        self.next_conn_limit_id.fetch_add(1, Ordering::Relaxed) as i64
+                    }
+                }
+            };
+            row.id = Some(id);
+            list.push(row.clone());
+            self.next_conn_limit_id
+                .fetch_max(id as u64 + 1, Ordering::Relaxed);
+            (row, id)
+        };
+        self.resync_conn_limits().await?;
+        info!("conn limit added via API: id={id} src={}", row.src_ip);
+        Ok(conn_limit_to_out(&row))
+    }
+
+    /// 原地替换一条并发连接数限制规则（PUT）。None = 不存在。
+    pub async fn update_conn_limit(
+        &self,
+        id: u64,
+        req: &ConnLimitUpdateRequest,
+    ) -> Result<Option<ConnLimitOut>> {
+        let src_ip: IpAddr = req.src_ip.parse().map_err(|_| anyhow!("invalid src_ip"))?;
+        if req.max_conns == 0 {
+            anyhow::bail!("max_conns must be > 0");
+        }
+        let row = {
+            let mut list = self.conn_limits.lock().unwrap();
+            let idx = match list.iter().position(|r| r.id == Some(id as i64)) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            if list
+                .iter()
+                .enumerate()
+                .any(|(i, r)| i != idx && r.src_ip == src_ip)
+            {
+                anyhow::bail!("conn limit for {src_ip} already exists");
+            }
+            let row = crate::persist::ConnLimitRow {
+                id: Some(id as i64),
+                src_ip,
+                max_conns: req.max_conns,
+                enabled: list[idx].enabled,
+            };
+            if let Some(p) = &self.persist {
+                p.update_conn_limit(id as i64, &row)?;
+            }
+            list[idx] = row.clone();
+            row
+        };
+        self.resync_conn_limits().await?;
+        info!("conn limit updated via API: id={id}");
+        Ok(Some(conn_limit_to_out(&row)))
+    }
+
+    /// 部分更新一条并发连接数限制规则（PATCH，启停）。None = 不存在。
+    pub async fn patch_conn_limit(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> Result<Option<ConnLimitOut>> {
+        let exists = {
+            let list = self.conn_limits.lock().unwrap();
+            list.iter().any(|r| r.id == Some(id as i64))
+        };
+        if !exists {
+            return Ok(None);
+        }
+        if let Some(v) = enabled {
+            if let Some(p) = &self.persist {
+                p.patch_conn_limit(id as i64, v)?;
+            }
+            let mut list = self.conn_limits.lock().unwrap();
+            if let Some(r) = list.iter_mut().find(|r| r.id == Some(id as i64)) {
+                r.enabled = v;
+            }
+        }
+        self.resync_conn_limits().await?;
+        Ok(self
+            .conn_limits
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == Some(id as i64))
+            .map(conn_limit_to_out))
+    }
+
+    /// 删除一条并发连接数限制规则（按 id）。
+    pub async fn delete_conn_limit(&self, id: u64) -> Result<bool> {
+        let removed = {
+            let mut list = self.conn_limits.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| r.id != Some(id as i64));
+            list.len() != before
+        };
+        if !removed {
+            return Ok(false);
+        }
+        if let Some(p) = &self.persist {
+            p.delete_conn_limit(id as i64)?;
+        }
+        self.resync_conn_limits().await?;
+        info!("conn limit deleted via API: id={id}");
+        Ok(true)
+    }
+
+    /// 批量删除并发连接数限制规则，返回删除条数。
+    pub async fn delete_conn_limits(&self, ids: &[u64]) -> Result<usize> {
+        let removed = {
+            let mut list = self.conn_limits.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| !ids.contains(&(r.id.unwrap_or(0) as u64)));
+            before - list.len()
+        };
+        if removed > 0 {
+            let ids_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+            if let Some(p) = &self.persist {
+                for id in ids_i64 {
+                    p.delete_conn_limit(id)?;
+                }
+            }
+            self.resync_conn_limits().await?;
+        }
+        Ok(removed)
+    }
+
+    /// 交换两条并发连接数限制规则的执行顺序。
+    pub async fn swap_conn_limits(
+        &self,
+        id_a: u64,
+        id_b: u64,
+    ) -> Result<Option<(ConnLimitOut, ConnLimitOut)>> {
+        if id_a == id_b {
+            return Ok(None);
+        }
+        match &self.persist {
+            Some(p) => {
+                if !p.swap_ids("conn_limit_rules", "id", id_a as i64, id_b as i64)? {
+                    return Ok(None);
+                }
+                *self.conn_limits.lock().unwrap() = p.load_conn_limits()?;
+            }
+            None => {
+                let mut list = self.conn_limits.lock().unwrap();
+                let mut ia = None;
+                let mut ib = None;
+                for (i, r) in list.iter().enumerate() {
+                    if r.id == Some(id_a as i64) {
+                        ia = Some(i);
+                    }
+                    if r.id == Some(id_b as i64) {
+                        ib = Some(i);
+                    }
+                }
+                let (i_a, i_b) = match (ia, ib) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Ok(None),
+                };
+                let tmp = list[i_a].id;
+                list[i_a].id = list[i_b].id;
+                list[i_b].id = tmp;
+            }
+        }
+        self.resync_conn_limits().await?;
+        let list = self.conn_limits.lock().unwrap();
+        let a = list.iter().find(|r| r.id == Some(id_a as i64));
+        let b = list.iter().find(|r| r.id == Some(id_b as i64));
+        match (a, b) {
+            (Some(a), Some(b)) => Ok(Some((conn_limit_to_out(a), conn_limit_to_out(b)))),
+            _ => Ok(None),
+        }
+    }
+
+    // ---- NAT 端口转发（/nat/rules）----
+
+    /// 当前全部 NAT 规则。
+    pub fn nat_rules_out(&self) -> Vec<NatRuleOut> {
+        self.nat_rules
+            .lock()
+            .unwrap()
+            .iter()
+            .map(nat_rule_to_out)
+            .collect()
+    }
+
+    /// 重同步 DNAT 规则表。
+    pub async fn resync_nat_rules(&self) -> Result<()> {
+        let entries = {
+            let list = self.nat_rules.lock().unwrap();
+            nat_entries_from_rows(&list, &self.interfaces)
+        };
+        let mut handle = self.handle.lock().await;
+        handle.sync_dnat_rules(&entries)
+    }
+
+    /// 新增一条 NAT 规则（id 可自定）。
+    pub async fn add_nat_rule(&self, req: &NatRuleRequest) -> Result<NatRuleOut> {
+        let dst_ip: Ipv4Addr = req.dst_ip.parse().map_err(|_| anyhow!("invalid dst_ip"))?;
+        let to_ip: Ipv4Addr = req.to_ip.parse().map_err(|_| anyhow!("invalid to_ip"))?;
+        if req.dst_port == 0 || req.to_port == 0 {
+            anyhow::bail!("dst_port/to_port must be nonzero");
+        }
+        let proto = match req.proto.as_str() {
+            "tcp" | "udp" => req.proto.clone(),
+            other => anyhow::bail!("unsupported proto {other:?} (tcp|udp)"),
+        };
+        let (row, id) = {
+            let mut list = self.nat_rules.lock().unwrap();
+            if list
+                .iter()
+                .any(|r| r.dst_ip == dst_ip && r.dst_port == req.dst_port && r.proto == proto)
+            {
+                anyhow::bail!("nat rule for {dst_ip}:{} {} already exists", req.dst_port, proto);
+            }
+            let mut row = crate::persist::NatRuleRow {
+                id: None,
+                dst_ip,
+                dst_port: req.dst_port,
+                proto,
+                to_ip,
+                to_port: req.to_port,
+                enabled: true,
+            };
+            let custom = match req.id {
+                Some(c) if c > 0 => {
+                    if list.iter().any(|r| r.id == Some(c as i64)) {
+                        anyhow::bail!("nat rule id {c} already in use");
+                    }
+                    c as i64
+                }
+                _ => 0,
+            };
+            if custom > 0 {
+                row.id = Some(custom);
+            }
+            let id = match &self.persist {
+                Some(p) => p.insert_nat_rule(&row)?,
+                None => {
+                    if custom > 0 {
+                        custom
+                    } else {
+                        self.next_nat_rule_id.fetch_add(1, Ordering::Relaxed) as i64
+                    }
+                }
+            };
+            row.id = Some(id);
+            list.push(row.clone());
+            self.next_nat_rule_id
+                .fetch_max(id as u64 + 1, Ordering::Relaxed);
+            (row, id)
+        };
+        self.resync_nat_rules().await?;
+        info!("nat rule added via API: id={id} {}:{}/{} -> {}:{}", row.dst_ip, row.dst_port, row.proto, row.to_ip, row.to_port);
+        Ok(nat_rule_to_out(&row))
+    }
+
+    /// 原地替换一条 NAT 规则（PUT）。None = 不存在。
+    pub async fn update_nat_rule(
+        &self,
+        id: u64,
+        req: &NatRuleUpdateRequest,
+    ) -> Result<Option<NatRuleOut>> {
+        let dst_ip: Ipv4Addr = req.dst_ip.parse().map_err(|_| anyhow!("invalid dst_ip"))?;
+        let to_ip: Ipv4Addr = req.to_ip.parse().map_err(|_| anyhow!("invalid to_ip"))?;
+        if req.dst_port == 0 || req.to_port == 0 {
+            anyhow::bail!("dst_port/to_port must be nonzero");
+        }
+        let proto = match req.proto.as_str() {
+            "tcp" | "udp" => req.proto.clone(),
+            other => anyhow::bail!("unsupported proto {other:?} (tcp|udp)"),
+        };
+        let row = {
+            let mut list = self.nat_rules.lock().unwrap();
+            let idx = match list.iter().position(|r| r.id == Some(id as i64)) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let row = crate::persist::NatRuleRow {
+                id: Some(id as i64),
+                dst_ip,
+                dst_port: req.dst_port,
+                proto,
+                to_ip,
+                to_port: req.to_port,
+                enabled: list[idx].enabled,
+            };
+            if let Some(p) = &self.persist {
+                p.update_nat_rule(id as i64, &row)?;
+            }
+            list[idx] = row.clone();
+            row
+        };
+        self.resync_nat_rules().await?;
+        info!("nat rule updated via API: id={id}");
+        Ok(Some(nat_rule_to_out(&row)))
+    }
+
+    /// 部分更新一条 NAT 规则（PATCH，启停）。None = 不存在。
+    pub async fn patch_nat_rule(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> Result<Option<NatRuleOut>> {
+        let exists = {
+            let list = self.nat_rules.lock().unwrap();
+            list.iter().any(|r| r.id == Some(id as i64))
+        };
+        if !exists {
+            return Ok(None);
+        }
+        if let Some(v) = enabled {
+            if let Some(p) = &self.persist {
+                p.patch_nat_rule(id as i64, v)?;
+            }
+            let mut list = self.nat_rules.lock().unwrap();
+            if let Some(r) = list.iter_mut().find(|r| r.id == Some(id as i64)) {
+                r.enabled = v;
+            }
+        }
+        self.resync_nat_rules().await?;
+        Ok(self
+            .nat_rules
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == Some(id as i64))
+            .map(nat_rule_to_out))
+    }
+
+    /// 删除一条 NAT 规则（按 id）。
+    pub async fn delete_nat_rule(&self, id: u64) -> Result<bool> {
+        let removed = {
+            let mut list = self.nat_rules.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| r.id != Some(id as i64));
+            list.len() != before
+        };
+        if !removed {
+            return Ok(false);
+        }
+        if let Some(p) = &self.persist {
+            p.delete_nat_rule(id as i64)?;
+        }
+        self.resync_nat_rules().await?;
+        info!("nat rule deleted via API: id={id}");
+        Ok(true)
+    }
+
+    /// 批量删除 NAT 规则，返回删除条数。
+    pub async fn delete_nat_rules(&self, ids: &[u64]) -> Result<usize> {
+        let removed = {
+            let mut list = self.nat_rules.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| !ids.contains(&(r.id.unwrap_or(0) as u64)));
+            before - list.len()
+        };
+        if removed > 0 {
+            let ids_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+            if let Some(p) = &self.persist {
+                for id in ids_i64 {
+                    p.delete_nat_rule(id)?;
+                }
+            }
+            self.resync_nat_rules().await?;
+        }
+        Ok(removed)
+    }
+
+    /// 交换两条 NAT 规则的执行顺序。
+    pub async fn swap_nat_rules(
+        &self,
+        id_a: u64,
+        id_b: u64,
+    ) -> Result<Option<(NatRuleOut, NatRuleOut)>> {
+        if id_a == id_b {
+            return Ok(None);
+        }
+        match &self.persist {
+            Some(p) => {
+                if !p.swap_ids("nat_rules", "id", id_a as i64, id_b as i64)? {
+                    return Ok(None);
+                }
+                *self.nat_rules.lock().unwrap() = p.load_nat_rules()?;
+            }
+            None => {
+                let mut list = self.nat_rules.lock().unwrap();
+                let mut ia = None;
+                let mut ib = None;
+                for (i, r) in list.iter().enumerate() {
+                    if r.id == Some(id_a as i64) {
+                        ia = Some(i);
+                    }
+                    if r.id == Some(id_b as i64) {
+                        ib = Some(i);
+                    }
+                }
+                let (i_a, i_b) = match (ia, ib) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Ok(None),
+                };
+                let tmp = list[i_a].id;
+                list[i_a].id = list[i_b].id;
+                list[i_b].id = tmp;
+            }
+        }
+        self.resync_nat_rules().await?;
+        let list = self.nat_rules.lock().unwrap();
+        let a = list.iter().find(|r| r.id == Some(id_a as i64));
+        let b = list.iter().find(|r| r.id == Some(id_b as i64));
+        match (a, b) {
+            (Some(a), Some(b)) => Ok(Some((nat_rule_to_out(a), nat_rule_to_out(b)))),
+            _ => Ok(None),
+        }
+    }
+
+    // ---- Zone 策略（/zones）----
+
+    /// 当前全部 Zone 策略（id 升序）。
+    pub fn zone_policies_out(&self) -> Vec<ZonePolicyOut> {
+        self.zone_policies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(zone_policy_to_out)
+            .collect()
+    }
+
+    /// 重同步 Zone 策略表。
+    pub async fn resync_zone_policies(&self) -> Result<()> {
+        let entries = {
+            let list = self.zone_policies.lock().unwrap();
+            zone_entries_from_rows(&list, &self.interfaces)
+        };
+        let mut handle = self.handle.lock().await;
+        handle.sync_zone_policies(&entries)
+    }
+
+    /// 新增一条 Zone 策略（id 可自定）。
+    pub async fn add_zone_policy(&self, req: &ZonePolicyRequest) -> Result<ZonePolicyOut> {
+        validate_zone_policy(&req.src_interface, &req.dst_interface, &req.action, &self.interfaces)?;
+        let (row, id) = {
+            let mut list = self.zone_policies.lock().unwrap();
+            let mut row = crate::persist::ZonePolicyRow {
+                id: None,
+                src_interface: req.src_interface.clone(),
+                dst_interface: req.dst_interface.clone(),
+                action: req.action.clone(),
+                enabled: true,
+            };
+            let custom = match req.id {
+                Some(c) if c > 0 => {
+                    if list.iter().any(|r| r.id == Some(c as i64)) {
+                        anyhow::bail!("zone policy id {c} already in use");
+                    }
+                    c as i64
+                }
+                _ => 0,
+            };
+            if custom > 0 {
+                row.id = Some(custom);
+            }
+            let id = match &self.persist {
+                Some(p) => p.insert_zone_policy(&row)?,
+                None => {
+                    if custom > 0 {
+                        custom
+                    } else {
+                        self.next_zone_policy_id.fetch_add(1, Ordering::Relaxed) as i64
+                    }
+                }
+            };
+            row.id = Some(id);
+            list.push(row.clone());
+            self.next_zone_policy_id
+                .fetch_max(id as u64 + 1, Ordering::Relaxed);
+            (row, id)
+        };
+        self.resync_zone_policies().await?;
+        info!(
+            "zone policy added via API: id={id} {} -> {} {}",
+            row.src_interface, row.dst_interface, row.action
+        );
+        Ok(zone_policy_to_out(&row))
+    }
+
+    /// 原地替换一条 Zone 策略（PUT）。None = 不存在。
+    pub async fn update_zone_policy(
+        &self,
+        id: u64,
+        req: &ZonePolicyUpdateRequest,
+    ) -> Result<Option<ZonePolicyOut>> {
+        validate_zone_policy(&req.src_interface, &req.dst_interface, &req.action, &self.interfaces)?;
+        let row = {
+            let mut list = self.zone_policies.lock().unwrap();
+            let idx = match list.iter().position(|r| r.id == Some(id as i64)) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let row = crate::persist::ZonePolicyRow {
+                id: Some(id as i64),
+                src_interface: req.src_interface.clone(),
+                dst_interface: req.dst_interface.clone(),
+                action: req.action.clone(),
+                enabled: list[idx].enabled,
+            };
+            if let Some(p) = &self.persist {
+                p.update_zone_policy(id as i64, &row)?;
+            }
+            list[idx] = row.clone();
+            row
+        };
+        self.resync_zone_policies().await?;
+        info!("zone policy updated via API: id={id}");
+        Ok(Some(zone_policy_to_out(&row)))
+    }
+
+    /// 部分更新一条 Zone 策略（PATCH，启停）。None = 不存在。
+    pub async fn patch_zone_policy(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> Result<Option<ZonePolicyOut>> {
+        let exists = {
+            let list = self.zone_policies.lock().unwrap();
+            list.iter().any(|r| r.id == Some(id as i64))
+        };
+        if !exists {
+            return Ok(None);
+        }
+        if let Some(v) = enabled {
+            if let Some(p) = &self.persist {
+                p.patch_zone_policy(id as i64, v)?;
+            }
+            let mut list = self.zone_policies.lock().unwrap();
+            if let Some(r) = list.iter_mut().find(|r| r.id == Some(id as i64)) {
+                r.enabled = v;
+            }
+        }
+        self.resync_zone_policies().await?;
+        Ok(self
+            .zone_policies
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == Some(id as i64))
+            .map(zone_policy_to_out))
+    }
+
+    /// 删除一条 Zone 策略（按 id）。
+    pub async fn delete_zone_policy(&self, id: u64) -> Result<bool> {
+        let removed = {
+            let mut list = self.zone_policies.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| r.id != Some(id as i64));
+            list.len() != before
+        };
+        if !removed {
+            return Ok(false);
+        }
+        if let Some(p) = &self.persist {
+            p.delete_zone_policy(id as i64)?;
+        }
+        self.resync_zone_policies().await?;
+        info!("zone policy deleted via API: id={id}");
+        Ok(true)
+    }
+
+    /// 批量删除 Zone 策略，返回删除条数。
+    pub async fn delete_zone_policies(&self, ids: &[u64]) -> Result<usize> {
+        let removed = {
+            let mut list = self.zone_policies.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| !ids.contains(&(r.id.unwrap_or(0) as u64)));
+            before - list.len()
+        };
+        if removed > 0 {
+            let ids_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+            if let Some(p) = &self.persist {
+                for id in ids_i64 {
+                    p.delete_zone_policy(id)?;
+                }
+            }
+            self.resync_zone_policies().await?;
+        }
+        Ok(removed)
+    }
+
+    /// 交换两条 Zone 策略的执行顺序。
+    pub async fn swap_zone_policies(
+        &self,
+        id_a: u64,
+        id_b: u64,
+    ) -> Result<Option<(ZonePolicyOut, ZonePolicyOut)>> {
+        if id_a == id_b {
+            return Ok(None);
+        }
+        match &self.persist {
+            Some(p) => {
+                if !p.swap_ids("zone_policies", "id", id_a as i64, id_b as i64)? {
+                    return Ok(None);
+                }
+                *self.zone_policies.lock().unwrap() = p.load_zone_policies()?;
+            }
+            None => {
+                let mut list = self.zone_policies.lock().unwrap();
+                let mut ia = None;
+                let mut ib = None;
+                for (i, r) in list.iter().enumerate() {
+                    if r.id == Some(id_a as i64) {
+                        ia = Some(i);
+                    }
+                    if r.id == Some(id_b as i64) {
+                        ib = Some(i);
+                    }
+                }
+                let (i_a, i_b) = match (ia, ib) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return Ok(None),
+                };
+                let tmp = list[i_a].id;
+                list[i_a].id = list[i_b].id;
+                list[i_b].id = tmp;
+            }
+        }
+        self.resync_zone_policies().await?;
+        let list = self.zone_policies.lock().unwrap();
+        let a = list.iter().find(|r| r.id == Some(id_a as i64));
+        let b = list.iter().find(|r| r.id == Some(id_b as i64));
+        match (a, b) {
+            (Some(a), Some(b)) => Ok(Some((zone_policy_to_out(a), zone_policy_to_out(b)))),
+            _ => Ok(None),
+        }
+    }
+
+    // ---- SYN Flood 防护（/security/syn-flood）----
+
+    /// 当前 SYN Flood 防护配置。
+    pub fn syn_flood_out(&self) -> SynFloodOut {
+        let row = self.syn_flood.lock().unwrap();
+        SynFloodOut {
+            rate_pps: row.rate_pps,
+            burst: row.burst,
+            max_half_open: row.max_half_open,
+        }
+    }
+
+    /// 整体替换 SYN Flood 防护配置并热同步 eBPF。
+    pub async fn update_syn_flood(&self, req: &SynFloodRequest) -> Result<SynFloodOut> {
+        if req.rate_pps > 4_000_000_000 {
+            anyhow::bail!("rate_pps too large");
+        }
+        if req.burst == 0 && req.rate_pps > 0 {
+            anyhow::bail!("burst must be > 0 when rate_pps enabled");
+        }
+        let row = crate::persist::SynFloodRow {
+            rate_pps: req.rate_pps,
+            burst: req.burst,
+            max_half_open: req.max_half_open,
+        };
+        if let Some(p) = &self.persist {
+            p.save_syn_flood(&row)?;
+        }
+        {
+            let mut guard = self.syn_flood.lock().unwrap();
+            *guard = row.clone();
+        }
+        let mut handle = self.handle.lock().await;
+        handle.sync_syn_flood(row.rate_pps, row.burst, row.max_half_open)?;
+        info!(
+            "syn_flood updated via API: rate={} burst={} half_open={}",
+            row.rate_pps, row.burst, row.max_half_open
+        );
+        Ok(SynFloodOut {
+            rate_pps: row.rate_pps,
+            burst: row.burst,
+            max_half_open: row.max_half_open,
+        })
+    }
 }
 
 // ---- QoS 辅助函数 ----
@@ -729,6 +1927,142 @@ fn qos_class_to_out(row: &crate::persist::QosClassRow) -> QosClassOut {
     }
 }
 
+// ---- 运行时规则集合辅助函数 ----
+
+/// 运行时 NAT 规则行（按 id 升序、启用）→ eBPF `(DnatKey, DnatValue)` 条目。
+fn nat_entries_from_rows(
+    rows: &[crate::persist::NatRuleRow],
+    _interfaces: &[crate::config::InterfaceConfig],
+) -> Vec<(DnatKey, DnatValue)> {
+    rows.iter()
+        .filter(|r| r.enabled)
+        .map(|r| {
+            let proto = match r.proto.as_str() {
+                "udp" => 17,
+                _ => 6,
+            };
+            let key = DnatKey::from_ipv4(u32::from(r.dst_ip), r.dst_port.to_be(), proto);
+            let value = DnatValue::from_ipv4(u32::from(r.to_ip), r.to_port.to_be());
+            (key, value)
+        })
+        .collect()
+}
+
+/// 运行时速率限制行（启用）→ eBPF `(IpKey, rate, burst)` 条目。
+fn rate_entries_from_rows(rows: &[crate::persist::RateLimitRow]) -> Vec<(IpKey, u32, u32)> {
+    rows.iter()
+        .filter(|r| r.enabled)
+        .map(|r| {
+            let key = match r.src_ip {
+                IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
+                IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
+            };
+            (key, r.rate, r.burst)
+        })
+        .collect()
+}
+
+/// 运行时并发连接数限制行（启用）→ eBPF `(IpKey, max_conns)` 条目。
+fn conn_entries_from_rows(rows: &[crate::persist::ConnLimitRow]) -> Vec<(IpKey, u32)> {
+    rows.iter()
+        .filter(|r| r.enabled)
+        .map(|r| {
+            let key = match r.src_ip {
+                IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
+                IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
+            };
+            (key, r.max_conns)
+        })
+        .collect()
+}
+
+/// 运行时 Zone 策略行（按 id 升序、启用）→ eBPF `ZoneEntry` 条目。
+///
+/// 与配置 `zone_entries()` 语义一致：每条策略生成 src→dst 网段与 dst→src 网段
+/// 两条双向条目，eBPF 按数组顺序（即 id 顺序）首匹配生效。
+fn zone_entries_from_rows(
+    rows: &[crate::persist::ZonePolicyRow],
+    interfaces: &[crate::config::InterfaceConfig],
+) -> Vec<ZoneEntry> {
+    let mut out = Vec::new();
+    for z in rows.iter().filter(|r| r.enabled) {
+        let Some(src) = interfaces.iter().find(|i| &i.name == &z.src_interface) else {
+            continue;
+        };
+        let Some(dst) = interfaces.iter().find(|i| &i.name == &z.dst_interface) else {
+            continue;
+        };
+        let action = match z.action.as_str() {
+            "drop" => k_firewall_common::ACTION_DROP,
+            _ => k_firewall_common::ACTION_PASS,
+        };
+        let (src_net, src_prefix) = match src.address {
+            Some(addr) => {
+                let mask = src.netmask.unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
+                (u32::from(addr) & u32::from(mask), crate::config::mask_bits(mask))
+            }
+            None => (0u32, 0u32),
+        };
+        let (dst_net, dst_prefix) = match dst.address {
+            Some(addr) => {
+                let mask = dst.netmask.unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
+                (u32::from(addr) & u32::from(mask), crate::config::mask_bits(mask))
+            }
+            None => (0u32, 0u32),
+        };
+        let src_idx = crate::ebpf_loader::if_index(&src.phy_name()).unwrap_or(0) as u32;
+        let dst_idx = crate::ebpf_loader::if_index(&dst.phy_name()).unwrap_or(0) as u32;
+        out.push(ZoneEntry::from_ipv4(src_idx, dst_net, dst_prefix as u8, action));
+        out.push(ZoneEntry::from_ipv4(dst_idx, src_net, src_prefix as u8, action));
+    }
+    out
+}
+
+/// 运行时 NAT 规则行 → API 输出。
+fn nat_rule_to_out(row: &crate::persist::NatRuleRow) -> NatRuleOut {
+    NatRuleOut {
+        id: row.id.unwrap_or(0) as u64,
+        dst_ip: row.dst_ip.to_string(),
+        dst_port: row.dst_port,
+        proto: row.proto.clone(),
+        to_ip: row.to_ip.to_string(),
+        to_port: row.to_port,
+        enabled: row.enabled,
+    }
+}
+
+/// 运行时速率限制行 → API 输出。
+fn rate_limit_to_out(row: &crate::persist::RateLimitRow) -> RateLimitOut {
+    RateLimitOut {
+        id: row.id.unwrap_or(0) as u64,
+        src_ip: row.src_ip.to_string(),
+        rate: row.rate,
+        burst: row.burst,
+        enabled: row.enabled,
+    }
+}
+
+/// 运行时并发连接数限制行 → API 输出。
+fn conn_limit_to_out(row: &crate::persist::ConnLimitRow) -> ConnLimitOut {
+    ConnLimitOut {
+        id: row.id.unwrap_or(0) as u64,
+        src_ip: row.src_ip.to_string(),
+        max_conns: row.max_conns,
+        enabled: row.enabled,
+    }
+}
+
+/// 运行时 Zone 策略行 → API 输出。
+fn zone_policy_to_out(row: &crate::persist::ZonePolicyRow) -> ZonePolicyOut {
+    ZonePolicyOut {
+        id: row.id.unwrap_or(0) as u64,
+        src_interface: row.src_interface.clone(),
+        dst_interface: row.dst_interface.clone(),
+        action: row.action.clone(),
+        enabled: row.enabled,
+    }
+}
+
 /// 校验 QoS 分类字段（与配置加载路径一致）。
 fn validate_qos_class(
     name: &str,
@@ -753,6 +2087,26 @@ fn validate_qos_class(
         if !iface.is_empty() && !interfaces.iter().any(|i| i.name == *iface) {
             anyhow::bail!("unknown ingress_iface {iface:?}");
         }
+    }
+    Ok(())
+}
+
+/// 校验 Zone 策略字段（与配置加载路径一致）。
+fn validate_zone_policy(
+    src_interface: &str,
+    dst_interface: &str,
+    action: &str,
+    interfaces: &[crate::config::InterfaceConfig],
+) -> Result<()> {
+    if !interfaces.iter().any(|i| i.name == src_interface) {
+        anyhow::bail!("unknown src_interface {src_interface:?}");
+    }
+    if !interfaces.iter().any(|i| i.name == dst_interface) {
+        anyhow::bail!("unknown dst_interface {dst_interface:?}");
+    }
+    match action {
+        "accept" | "drop" => {}
+        other => anyhow::bail!("unsupported action {other:?} (accept|drop)"),
     }
     Ok(())
 }
@@ -1778,6 +3132,470 @@ async fn delete_qos_classes(
     })))
 }
 
+// /api/v1/security/rate-limits：源 IP 速率限制 CRUD（热同步 RATE_LIMITS）
+// ============================================================================
+
+/// GET /api/v1/security/rate-limits：列出全部速率限制规则。
+async fn list_rate_limits(State(s): State<Arc<AppState>>) -> Json<RateLimitListOut> {
+    let entries = s.rate_limits_out();
+    let total = entries.len();
+    Json(RateLimitListOut { total, entries })
+}
+
+/// POST /api/v1/security/rate-limits：新增（id 可自定）。
+async fn add_rate_limit(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<RateLimitRequest>,
+) -> Result<Json<RateLimitOut>, ApiError> {
+    let out = s
+        .add_rate_limit(&req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(out))
+}
+
+/// PUT /api/v1/security/rate-limits/{id}：原地替换。
+async fn update_rate_limit(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<RateLimitUpdateRequest>,
+) -> Result<Json<RateLimitOut>, ApiError> {
+    let out = s
+        .update_rate_limit(id, &req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("rate limit {id} not found")))
+        .map(Json)
+}
+
+/// PATCH /api/v1/security/rate-limits/{id}：启停。
+async fn patch_rate_limit(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<QosClassPatchRequest>,
+) -> Result<Json<RateLimitOut>, ApiError> {
+    if req.enabled.is_none() {
+        return Err(ApiError::bad_request("enabled is required"));
+    }
+    let out = s
+        .patch_rate_limit(id, req.enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("rate limit {id} not found")))
+        .map(Json)
+}
+
+/// DELETE /api/v1/security/rate-limits/{id}：删除单个。
+async fn delete_rate_limit(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = s
+        .delete_rate_limit(id)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !removed {
+        return Err(ApiError::bad_request(format!("rate limit {id} not found")));
+    }
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.rate_limits_out(),
+    })))
+}
+
+/// DELETE /api/v1/security/rate-limits：按 ids 批量删除。
+async fn delete_rate_limits(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<RateLimitDeleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::bad_request("ids is required"));
+    }
+    let removed = s
+        .delete_rate_limits(&req.ids)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.rate_limits_out(),
+    })))
+}
+
+/// POST /api/v1/security/rate-limits/swap：交换两条规则的执行顺序。
+async fn swap_rate_limits(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<OrderSwapRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = s
+        .swap_rate_limits(req.id_a, req.id_b)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    match out {
+        Some((a, b)) => Ok(Json(serde_json::json!({
+            "swapped": true,
+            "a": a,
+            "b": b,
+            "entries": s.rate_limits_out(),
+        }))),
+        None => Err(ApiError::bad_request(
+            "one or both ids not found (or id_a == id_b)",
+        )),
+    }
+}
+
+// /api/v1/security/conn-limits：每源并发连接数限制 CRUD（热同步 CONN_LIMITS）
+// ============================================================================
+
+/// GET /api/v1/security/conn-limits：列出全部并发连接数限制规则。
+async fn list_conn_limits(State(s): State<Arc<AppState>>) -> Json<ConnLimitListOut> {
+    let entries = s.conn_limits_out();
+    let total = entries.len();
+    Json(ConnLimitListOut { total, entries })
+}
+
+/// POST /api/v1/security/conn-limits：新增（id 可自定）。
+async fn add_conn_limit(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<ConnLimitRequest>,
+) -> Result<Json<ConnLimitOut>, ApiError> {
+    let out = s
+        .add_conn_limit(&req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(out))
+}
+
+/// PUT /api/v1/security/conn-limits/{id}：原地替换。
+async fn update_conn_limit(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<ConnLimitUpdateRequest>,
+) -> Result<Json<ConnLimitOut>, ApiError> {
+    let out = s
+        .update_conn_limit(id, &req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("conn limit {id} not found")))
+        .map(Json)
+}
+
+/// PATCH /api/v1/security/conn-limits/{id}：启停。
+async fn patch_conn_limit(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<QosClassPatchRequest>,
+) -> Result<Json<ConnLimitOut>, ApiError> {
+    if req.enabled.is_none() {
+        return Err(ApiError::bad_request("enabled is required"));
+    }
+    let out = s
+        .patch_conn_limit(id, req.enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("conn limit {id} not found")))
+        .map(Json)
+}
+
+/// DELETE /api/v1/security/conn-limits/{id}：删除单个。
+async fn delete_conn_limit(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = s
+        .delete_conn_limit(id)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !removed {
+        return Err(ApiError::bad_request(format!("conn limit {id} not found")));
+    }
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.conn_limits_out(),
+    })))
+}
+
+/// DELETE /api/v1/security/conn-limits：按 ids 批量删除。
+async fn delete_conn_limits(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<ConnLimitDeleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::bad_request("ids is required"));
+    }
+    let removed = s
+        .delete_conn_limits(&req.ids)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.conn_limits_out(),
+    })))
+}
+
+/// POST /api/v1/security/conn-limits/swap：交换两条规则的执行顺序。
+async fn swap_conn_limits(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<OrderSwapRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = s
+        .swap_conn_limits(req.id_a, req.id_b)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    match out {
+        Some((a, b)) => Ok(Json(serde_json::json!({
+            "swapped": true,
+            "a": a,
+            "b": b,
+            "entries": s.conn_limits_out(),
+        }))),
+        None => Err(ApiError::bad_request(
+            "one or both ids not found (or id_a == id_b)",
+        )),
+    }
+}
+
+// /api/v1/security/syn-flood：SYN Flood 全局防护配置
+// ============================================================================
+
+/// GET /api/v1/security/syn-flood：读取配置。
+async fn get_syn_flood(State(s): State<Arc<AppState>>) -> Json<SynFloodOut> {
+    Json(s.syn_flood_out())
+}
+
+/// PUT /api/v1/security/syn-flood：整体替换配置。
+async fn put_syn_flood(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<SynFloodRequest>,
+) -> Result<Json<SynFloodOut>, ApiError> {
+    let out = s
+        .update_syn_flood(&req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(out))
+}
+
+// /api/v1/nat/rules：DNAT 端口转发规则 CRUD（热同步 DNAT_RULES）
+// ============================================================================
+
+/// GET /api/v1/nat/rules：列出全部 NAT 规则。
+async fn list_nat_rules(State(s): State<Arc<AppState>>) -> Json<NatRuleListOut> {
+    let entries = s.nat_rules_out();
+    let total = entries.len();
+    Json(NatRuleListOut { total, entries })
+}
+
+/// POST /api/v1/nat/rules：新增（id 可自定）。
+async fn add_nat_rule(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<NatRuleRequest>,
+) -> Result<Json<NatRuleOut>, ApiError> {
+    let out = s
+        .add_nat_rule(&req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(out))
+}
+
+/// PUT /api/v1/nat/rules/{id}：原地替换。
+async fn update_nat_rule(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<NatRuleUpdateRequest>,
+) -> Result<Json<NatRuleOut>, ApiError> {
+    let out = s
+        .update_nat_rule(id, &req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("nat rule {id} not found")))
+        .map(Json)
+}
+
+/// PATCH /api/v1/nat/rules/{id}：启停。
+async fn patch_nat_rule(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<QosClassPatchRequest>,
+) -> Result<Json<NatRuleOut>, ApiError> {
+    if req.enabled.is_none() {
+        return Err(ApiError::bad_request("enabled is required"));
+    }
+    let out = s
+        .patch_nat_rule(id, req.enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("nat rule {id} not found")))
+        .map(Json)
+}
+
+/// DELETE /api/v1/nat/rules/{id}：删除单个。
+async fn delete_nat_rule(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = s
+        .delete_nat_rule(id)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !removed {
+        return Err(ApiError::bad_request(format!("nat rule {id} not found")));
+    }
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.nat_rules_out(),
+    })))
+}
+
+/// DELETE /api/v1/nat/rules：按 ids 批量删除。
+async fn delete_nat_rules(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<NatRuleDeleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::bad_request("ids is required"));
+    }
+    let removed = s
+        .delete_nat_rules(&req.ids)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.nat_rules_out(),
+    })))
+}
+
+/// POST /api/v1/nat/rules/swap：交换两条规则的执行顺序。
+async fn swap_nat_rules(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<OrderSwapRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = s
+        .swap_nat_rules(req.id_a, req.id_b)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    match out {
+        Some((a, b)) => Ok(Json(serde_json::json!({
+            "swapped": true,
+            "a": a,
+            "b": b,
+            "entries": s.nat_rules_out(),
+        }))),
+        None => Err(ApiError::bad_request(
+            "one or both ids not found (or id_a == id_b)",
+        )),
+    }
+}
+
+// /api/v1/zones：Zone 策略 CRUD（热同步 ZONE；id 顺序即执行顺序）
+// ============================================================================
+
+/// GET /api/v1/zones：列出全部 Zone 策略。
+async fn list_zone_policies(State(s): State<Arc<AppState>>) -> Json<ZonePolicyListOut> {
+    let entries = s.zone_policies_out();
+    let total = entries.len();
+    Json(ZonePolicyListOut { total, entries })
+}
+
+/// POST /api/v1/zones：新增（id 可自定）。
+async fn add_zone_policy(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<ZonePolicyRequest>,
+) -> Result<Json<ZonePolicyOut>, ApiError> {
+    let out = s
+        .add_zone_policy(&req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(out))
+}
+
+/// PUT /api/v1/zones/{id}：原地替换。
+async fn update_zone_policy(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<ZonePolicyUpdateRequest>,
+) -> Result<Json<ZonePolicyOut>, ApiError> {
+    let out = s
+        .update_zone_policy(id, &req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("zone policy {id} not found")))
+        .map(Json)
+}
+
+/// PATCH /api/v1/zones/{id}：启停。
+async fn patch_zone_policy(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<QosClassPatchRequest>,
+) -> Result<Json<ZonePolicyOut>, ApiError> {
+    if req.enabled.is_none() {
+        return Err(ApiError::bad_request("enabled is required"));
+    }
+    let out = s
+        .patch_zone_policy(id, req.enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("zone policy {id} not found")))
+        .map(Json)
+}
+
+/// DELETE /api/v1/zones/{id}：删除单个。
+async fn delete_zone_policy(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = s
+        .delete_zone_policy(id)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !removed {
+        return Err(ApiError::bad_request(format!("zone policy {id} not found")));
+    }
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.zone_policies_out(),
+    })))
+}
+
+/// DELETE /api/v1/zones：按 ids 批量删除。
+async fn delete_zone_policies(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<ZonePolicyDeleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::bad_request("ids is required"));
+    }
+    let removed = s
+        .delete_zone_policies(&req.ids)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "entries": s.zone_policies_out(),
+    })))
+}
+
+/// POST /api/v1/zones/swap：交换两条策略的执行顺序。
+async fn swap_zone_policies(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<OrderSwapRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let out = s
+        .swap_zone_policies(req.id_a, req.id_b)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    match out {
+        Some((a, b)) => Ok(Json(serde_json::json!({
+            "swapped": true,
+            "a": a,
+            "b": b,
+            "entries": s.zone_policies_out(),
+        }))),
+        None => Err(ApiError::bad_request(
+            "one or both ids not found (or id_a == id_b)",
+        )),
+    }
+}
+
 fn router(state: Arc<AppState>, strict_auth: bool) -> Router {
     // 所有端点（含扁平兼容路由）都必须携带 API Key。`strict_auth` 控制
     // `api_keys` 为空时的行为：HTTP 服务强制拒绝（fail-closed），Unix socket
@@ -1835,6 +3653,52 @@ fn router(state: Arc<AppState>, strict_auth: bool) -> Router {
                 .delete(delete_qos_class),
         )
         .route("/qos/classes", delete(delete_qos_classes))
+        .route(
+            "/security/rate-limits",
+            get(list_rate_limits).post(add_rate_limit),
+        )
+        .route("/security/rate-limits/swap", post(swap_rate_limits))
+        .route(
+            "/security/rate-limits/{id}",
+            put(update_rate_limit)
+                .patch(patch_rate_limit)
+                .delete(delete_rate_limit),
+        )
+        .route("/security/rate-limits", delete(delete_rate_limits))
+        .route(
+            "/security/conn-limits",
+            get(list_conn_limits).post(add_conn_limit),
+        )
+        .route("/security/conn-limits/swap", post(swap_conn_limits))
+        .route(
+            "/security/conn-limits/{id}",
+            put(update_conn_limit)
+                .patch(patch_conn_limit)
+                .delete(delete_conn_limit),
+        )
+        .route("/security/conn-limits", delete(delete_conn_limits))
+        .route(
+            "/security/syn-flood",
+            get(get_syn_flood).put(put_syn_flood),
+        )
+        .route("/nat/rules", get(list_nat_rules).post(add_nat_rule))
+        .route("/nat/rules/swap", post(swap_nat_rules))
+        .route(
+            "/nat/rules/{id}",
+            put(update_nat_rule)
+                .patch(patch_nat_rule)
+                .delete(delete_nat_rule),
+        )
+        .route("/nat/rules", delete(delete_nat_rules))
+        .route("/zones", get(list_zone_policies).post(add_zone_policy))
+        .route("/zones/swap", post(swap_zone_policies))
+        .route(
+            "/zones/{id}",
+            put(update_zone_policy)
+                .patch(patch_zone_policy)
+                .delete(delete_zone_policy),
+        )
+        .route("/zones", delete(delete_zone_policies))
         .layer(require_key.clone())
         // 统一响应信封最外层：包裹成功/失败响应为 {code, message, data}。
         .layer(middleware::from_fn(wrap_envelope));

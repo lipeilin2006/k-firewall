@@ -94,7 +94,7 @@ static RATE_LIMITS: LruHashMap<IpKey, RateState> = LruHashMap::with_max_entries(
 
 /// 运行配置（数组槽位见 `k_firewall_common::CONFIG_*`）。
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(10, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(11, 0);
 
 /// (物理接口 ifindex, VLAN ID) -> VIF 配置。
 #[map]
@@ -142,9 +142,13 @@ static SURICATA_RULES_SRC: LpmTrie<[u8; 13], u8> = LpmTrie::with_max_entries(655
 #[map]
 static SURICATA_RULES_SRC_ANY: LpmTrie<[u8; 9], u8> = LpmTrie::with_max_entries(65536, 0);
 
-/// Zone 策略 LpmTrie：`(src 接口 ifindex, dst IP)` -> 动作。
+/// Zone 策略数组（有序，首匹配生效）：`(src 接口 ifindex, dst 网段/前缀)` -> 动作。
+///
+/// daemon 按策略 id 升序写入（数组下标即执行顺序），XDP 从 0 起顺序遍历，
+/// 首个命中的策略动作生效（与 `QOS_CLASSES` 同模式）。
 #[map]
-static ZONE: LpmTrie<[u8; 8], u8> = LpmTrie::with_max_entries(4096, 0);
+static ZONE: Array<k_firewall_common::maps::ZoneEntry> =
+    Array::with_max_entries(k_firewall_common::maps::ZONE_MAX, 0);
 
 /// 端口转发（DNAT）规则：`(WAN IP:端口, proto)` -> 内部服务器。
 #[map]
@@ -1376,13 +1380,50 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         }
     }
 
-    // Zone 策略（接口级粗粒度）。
+    // Zone 策略（接口级粗粒度，按 id 顺序首匹配）。
     let zone_action = {
         if is_ipv4 {
-            let mut data = [0u8; 8];
-            data[0..4].copy_from_slice(&(ctx.ingress_ifindex() as u32).to_be_bytes());
-            data[4..8].copy_from_slice(&dst_ip.to_be_bytes());
-            ZONE.get(&LpmKey::new(64, data)).copied()
+            let count = CONFIG
+                .get(k_firewall_common::CONFIG_ZONE_COUNT)
+                .copied()
+                .unwrap_or(0);
+            if count == 0 {
+                None
+            } else {
+                let count = count.min(k_firewall_common::maps::ZONE_MAX);
+                let ingress = ctx.ingress_ifindex() as u32;
+                let mut action: u8 = k_firewall_common::DEFAULT_ACTION;
+                let mut hit = false;
+                let mut i: u32 = 0;
+                while i < count {
+                    let e = match ZONE.get(i) {
+                        Some(e) => *e,
+                        None => break,
+                    };
+                    if e.src_ifindex != 0 && e.src_ifindex != ingress {
+                        i += 1;
+                        continue;
+                    }
+                    let mask = if e.prefix_len == 0 {
+                        0u32
+                    } else {
+                        u32::MAX << (32 - e.prefix_len)
+                    };
+                    let dst_net =
+                        u32::from_be_bytes([e.dst_net[0], e.dst_net[1], e.dst_net[2], e.dst_net[3]]);
+                    if (dst_ip & mask) == dst_net {
+                        action = e.action;
+                        hit = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if hit {
+                    Some(action)
+                } else {
+                    None
+                }
+            }
         } else {
             None
         }

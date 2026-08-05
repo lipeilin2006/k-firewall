@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension as _, params};
 
 /// SQLite 持久化句柄（持路径；每次操作打开连接，避免跨任务共享连接）。
 #[derive(Debug, Clone)]
@@ -63,6 +63,75 @@ pub struct QosClassRow {
     pub enabled: bool,
 }
 
+/// 运行时源 IP 速率限制规则行（`rate_limit_rules`）。
+#[derive(Debug, Clone)]
+pub struct RateLimitRow {
+    pub id: Option<i64>,
+    /// 源地址（IPv4 / IPv6）。
+    pub src_ip: IpAddr,
+    /// 每秒令牌数（pps）。
+    pub rate: u32,
+    /// 桶容量（突发包数）。
+    pub burst: u32,
+    /// 是否启用。
+    pub enabled: bool,
+}
+
+/// 运行时每源并发连接数限制规则行（`conn_limit_rules`）。
+#[derive(Debug, Clone)]
+pub struct ConnLimitRow {
+    pub id: Option<i64>,
+    /// 源地址（IPv4 / IPv6）。
+    pub src_ip: IpAddr,
+    /// 允许的最大并发连接数。
+    pub max_conns: u32,
+    /// 是否启用。
+    pub enabled: bool,
+}
+
+/// 运行时 DNAT 端口转发规则行（`nat_rules`）。
+#[derive(Debug, Clone)]
+pub struct NatRuleRow {
+    pub id: Option<i64>,
+    /// 公网（WAN）目的 IP（IPv4）。
+    pub dst_ip: std::net::Ipv4Addr,
+    /// 公网目的端口。
+    pub dst_port: u16,
+    /// tcp | udp。
+    pub proto: String,
+    /// 内部服务器 IP（IPv4）。
+    pub to_ip: std::net::Ipv4Addr,
+    /// 内部服务器端口。
+    pub to_port: u16,
+    /// 是否启用。
+    pub enabled: bool,
+}
+
+/// 运行时 Zone 策略行（`zone_policies`）。
+#[derive(Debug, Clone)]
+pub struct ZonePolicyRow {
+    pub id: Option<i64>,
+    /// 源接口（逻辑名）。
+    pub src_interface: String,
+    /// 目的接口（逻辑名）。
+    pub dst_interface: String,
+    /// accept | drop。
+    pub action: String,
+    /// 是否启用。
+    pub enabled: bool,
+}
+
+/// 运行时 SYN Flood 全局防护配置行（`syn_flood_config` 单行）。
+#[derive(Debug, Clone)]
+pub struct SynFloodRow {
+    /// 每源 IP 新建连接（SYN）速率上限（pps）；0 = 关闭。
+    pub rate_pps: u32,
+    /// 令牌桶突发容量。
+    pub burst: u32,
+    /// 每源 IP 半开连接数上限；0 = 关闭。
+    pub max_half_open: u32,
+}
+
 impl Persist {
     /// 打开（必要时创建）数据库并建表。
     pub fn open(path: &Path) -> Result<Self> {
@@ -100,6 +169,41 @@ impl Persist {
                      rate_bps      INTEGER NOT NULL DEFAULT 0,
                      burst_bytes   INTEGER NOT NULL DEFAULT 16000,
                      enabled       INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE IF NOT EXISTS rate_limit_rules (
+                     id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                     src_ip  TEXT NOT NULL,
+                     rate    INTEGER NOT NULL,
+                     burst   INTEGER NOT NULL DEFAULT 1000,
+                     enabled INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE IF NOT EXISTS conn_limit_rules (
+                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                     src_ip    TEXT NOT NULL,
+                     max_conns INTEGER NOT NULL,
+                     enabled   INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE IF NOT EXISTS nat_rules (
+                     id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     dst_ip   TEXT NOT NULL,
+                     dst_port INTEGER NOT NULL,
+                     proto    TEXT NOT NULL DEFAULT 'tcp',
+                     to_ip    TEXT NOT NULL,
+                     to_port  INTEGER NOT NULL,
+                     enabled  INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE IF NOT EXISTS zone_policies (
+                     id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                     src_interface  TEXT NOT NULL,
+                     dst_interface  TEXT NOT NULL,
+                     action         TEXT NOT NULL,
+                     enabled        INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE IF NOT EXISTS syn_flood_config (
+                     id            INTEGER PRIMARY KEY CHECK (id = 1),
+                     rate_pps      INTEGER NOT NULL DEFAULT 0,
+                     burst         INTEGER NOT NULL DEFAULT 100,
+                     max_half_open INTEGER NOT NULL DEFAULT 0
                  );",
             )
             .context("init schema")?;
@@ -429,6 +533,530 @@ impl Persist {
             c.execute("DELETE FROM qos_classes", [])
                 .context("clear qos classes")?;
             Ok(())
+        })
+    }
+
+    // ============================================================================
+    // 运行时速率限制规则（`rate_limit_rules`）
+    // ============================================================================
+
+    /// 读取全部速率限制规则（按 id 升序）。
+    pub fn load_rate_limits(&self) -> Result<Vec<RateLimitRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT id, src_ip, rate, burst, enabled FROM rate_limit_rules ORDER BY id")
+                .context("prepare load_rate_limits")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let src_ip: String = r.get(1)?;
+                    let src_ip: IpAddr = src_ip
+                        .parse()
+                        .map_err(|e: std::net::AddrParseError| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    Ok(RateLimitRow {
+                        id: Some(r.get(0)?),
+                        src_ip,
+                        rate: r.get::<_, i64>(2)? as u32,
+                        burst: r.get::<_, i64>(3)? as u32,
+                        enabled: r.get(4)?,
+                    })
+                })
+                .context("query rate_limit_rules")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("read rate limit row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 写入（insert）一条速率限制规则，返回新 id。`id` 可自定义（唯一即可）。
+    pub fn insert_rate_limit(&self, row: &RateLimitRow) -> Result<i64> {
+        self.with_conn(|c| {
+            match row.id {
+                Some(id) => {
+                    c.execute(
+                        "INSERT INTO rate_limit_rules (id, src_ip, rate, burst, enabled)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![id, row.src_ip.to_string(), row.rate as i64, row.burst as i64, row.enabled],
+                    )
+                    .context("insert rate limit with custom id")?;
+                    Ok(id)
+                }
+                None => {
+                    c.execute(
+                        "INSERT INTO rate_limit_rules (src_ip, rate, burst, enabled)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![row.src_ip.to_string(), row.rate as i64, row.burst as i64, row.enabled],
+                    )
+                    .context("insert rate limit")?;
+                    Ok(c.last_insert_rowid())
+                }
+            }
+        })
+    }
+
+    /// 按 id 更新一条速率限制规则（PUT 用）。
+    pub fn update_rate_limit(&self, id: i64, row: &RateLimitRow) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE rate_limit_rules SET src_ip=?1, rate=?2, burst=?3 WHERE id=?4",
+                    params![row.src_ip.to_string(), row.rate as i64, row.burst as i64, id],
+                )
+                .context("update rate limit")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 更新启用字段（PATCH 用）。
+    pub fn patch_rate_limit(&self, id: i64, enabled: bool) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE rate_limit_rules SET enabled=?1 WHERE id=?2",
+                    params![enabled, id],
+                )
+                .context("patch rate limit")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 删除一条速率限制规则。
+    pub fn delete_rate_limit(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute("DELETE FROM rate_limit_rules WHERE id = ?1", params![id])
+                .context("delete rate limit")?;
+            Ok(n > 0)
+        })
+    }
+
+    // ============================================================================
+    // 运行时每源并发连接数限制规则（`conn_limit_rules`）
+    // ============================================================================
+
+    /// 读取全部并发连接数限制规则（按 id 升序）。
+    pub fn load_conn_limits(&self) -> Result<Vec<ConnLimitRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT id, src_ip, max_conns, enabled FROM conn_limit_rules ORDER BY id")
+                .context("prepare load_conn_limits")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let src_ip: String = r.get(1)?;
+                    let src_ip: IpAddr = src_ip
+                        .parse()
+                        .map_err(|e: std::net::AddrParseError| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    Ok(ConnLimitRow {
+                        id: Some(r.get(0)?),
+                        src_ip,
+                        max_conns: r.get::<_, i64>(2)? as u32,
+                        enabled: r.get(3)?,
+                    })
+                })
+                .context("query conn_limit_rules")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("read conn limit row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 写入（insert）一条并发连接数限制规则，返回新 id。`id` 可自定义。
+    pub fn insert_conn_limit(&self, row: &ConnLimitRow) -> Result<i64> {
+        self.with_conn(|c| {
+            match row.id {
+                Some(id) => {
+                    c.execute(
+                        "INSERT INTO conn_limit_rules (id, src_ip, max_conns, enabled)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![id, row.src_ip.to_string(), row.max_conns as i64, row.enabled],
+                    )
+                    .context("insert conn limit with custom id")?;
+                    Ok(id)
+                }
+                None => {
+                    c.execute(
+                        "INSERT INTO conn_limit_rules (src_ip, max_conns, enabled)
+                         VALUES (?1, ?2, ?3)",
+                        params![row.src_ip.to_string(), row.max_conns as i64, row.enabled],
+                    )
+                    .context("insert conn limit")?;
+                    Ok(c.last_insert_rowid())
+                }
+            }
+        })
+    }
+
+    /// 按 id 更新一条并发连接数限制规则（PUT 用）。
+    pub fn update_conn_limit(&self, id: i64, row: &ConnLimitRow) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE conn_limit_rules SET src_ip=?1, max_conns=?2 WHERE id=?3",
+                    params![row.src_ip.to_string(), row.max_conns as i64, id],
+                )
+                .context("update conn limit")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 更新启用字段（PATCH 用）。
+    pub fn patch_conn_limit(&self, id: i64, enabled: bool) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE conn_limit_rules SET enabled=?1 WHERE id=?2",
+                    params![enabled, id],
+                )
+                .context("patch conn limit")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 删除一条并发连接数限制规则。
+    pub fn delete_conn_limit(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute("DELETE FROM conn_limit_rules WHERE id = ?1", params![id])
+                .context("delete conn limit")?;
+            Ok(n > 0)
+        })
+    }
+
+    // ============================================================================
+    // 运行时 DNAT 端口转发规则（`nat_rules`）
+    // ============================================================================
+
+    /// 读取全部 DNAT 规则（按 id 升序）。
+    pub fn load_nat_rules(&self) -> Result<Vec<NatRuleRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT id, dst_ip, dst_port, proto, to_ip, to_port, enabled FROM nat_rules ORDER BY id")
+                .context("prepare load_nat_rules")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let dst_ip: String = r.get(1)?;
+                    let dst_ip = dst_ip
+                        .parse()
+                        .map_err(|e: std::net::AddrParseError| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    let to_ip: String = r.get(4)?;
+                    let to_ip = to_ip
+                        .parse()
+                        .map_err(|e: std::net::AddrParseError| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    Ok(NatRuleRow {
+                        id: Some(r.get(0)?),
+                        dst_ip,
+                        dst_port: r.get::<_, i64>(2)? as u16,
+                        proto: r.get(3)?,
+                        to_ip,
+                        to_port: r.get::<_, i64>(5)? as u16,
+                        enabled: r.get(6)?,
+                    })
+                })
+                .context("query nat_rules")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("read nat rule row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 写入（insert）一条 DNAT 规则，返回新 id。`id` 可自定义。
+    pub fn insert_nat_rule(&self, row: &NatRuleRow) -> Result<i64> {
+        self.with_conn(|c| {
+            match row.id {
+                Some(id) => {
+                    c.execute(
+                        "INSERT INTO nat_rules (id, dst_ip, dst_port, proto, to_ip, to_port, enabled)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            id,
+                            row.dst_ip.to_string(),
+                            row.dst_port as i64,
+                            row.proto,
+                            row.to_ip.to_string(),
+                            row.to_port as i64,
+                            row.enabled,
+                        ],
+                    )
+                    .context("insert nat rule with custom id")?;
+                    Ok(id)
+                }
+                None => {
+                    c.execute(
+                        "INSERT INTO nat_rules (dst_ip, dst_port, proto, to_ip, to_port, enabled)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            row.dst_ip.to_string(),
+                            row.dst_port as i64,
+                            row.proto,
+                            row.to_ip.to_string(),
+                            row.to_port as i64,
+                            row.enabled,
+                        ],
+                    )
+                    .context("insert nat rule")?;
+                    Ok(c.last_insert_rowid())
+                }
+            }
+        })
+    }
+
+    /// 按 id 更新一条 DNAT 规则（PUT 用）。
+    pub fn update_nat_rule(&self, id: i64, row: &NatRuleRow) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE nat_rules SET dst_ip=?1, dst_port=?2, proto=?3, to_ip=?4, to_port=?5
+                     WHERE id=?6",
+                    params![
+                        row.dst_ip.to_string(),
+                        row.dst_port as i64,
+                        row.proto,
+                        row.to_ip.to_string(),
+                        row.to_port as i64,
+                        id,
+                    ],
+                )
+                .context("update nat rule")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 更新启用字段（PATCH 用）。
+    pub fn patch_nat_rule(&self, id: i64, enabled: bool) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE nat_rules SET enabled=?1 WHERE id=?2",
+                    params![enabled, id],
+                )
+                .context("patch nat rule")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 删除一条 DNAT 规则。
+    pub fn delete_nat_rule(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute("DELETE FROM nat_rules WHERE id = ?1", params![id])
+                .context("delete nat rule")?;
+            Ok(n > 0)
+        })
+    }
+
+    // ============================================================================
+    // 运行时 Zone 策略（`zone_policies`）
+    // ============================================================================
+
+    /// 读取全部 Zone 策略（按 id 升序）。
+    pub fn load_zone_policies(&self) -> Result<Vec<ZonePolicyRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare("SELECT id, src_interface, dst_interface, action, enabled FROM zone_policies ORDER BY id")
+                .context("prepare load_zone_policies")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ZonePolicyRow {
+                        id: Some(r.get(0)?),
+                        src_interface: r.get(1)?,
+                        dst_interface: r.get(2)?,
+                        action: r.get(3)?,
+                        enabled: r.get(4)?,
+                    })
+                })
+                .context("query zone_policies")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("read zone policy row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 写入（insert）一条 Zone 策略，返回新 id。`id` 可自定义。
+    pub fn insert_zone_policy(&self, row: &ZonePolicyRow) -> Result<i64> {
+        self.with_conn(|c| {
+            match row.id {
+                Some(id) => {
+                    c.execute(
+                        "INSERT INTO zone_policies (id, src_interface, dst_interface, action, enabled)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![id, row.src_interface, row.dst_interface, row.action, row.enabled],
+                    )
+                    .context("insert zone policy with custom id")?;
+                    Ok(id)
+                }
+                None => {
+                    c.execute(
+                        "INSERT INTO zone_policies (src_interface, dst_interface, action, enabled)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![row.src_interface, row.dst_interface, row.action, row.enabled],
+                    )
+                    .context("insert zone policy")?;
+                    Ok(c.last_insert_rowid())
+                }
+            }
+        })
+    }
+
+    /// 按 id 更新一条 Zone 策略（PUT 用）。
+    pub fn update_zone_policy(&self, id: i64, row: &ZonePolicyRow) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE zone_policies SET src_interface=?1, dst_interface=?2, action=?3
+                     WHERE id=?4",
+                    params![row.src_interface, row.dst_interface, row.action, id],
+                )
+                .context("update zone policy")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 更新启用字段（PATCH 用）。
+    pub fn patch_zone_policy(&self, id: i64, enabled: bool) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE zone_policies SET enabled=?1 WHERE id=?2",
+                    params![enabled, id],
+                )
+                .context("patch zone policy")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 删除一条 Zone 策略。
+    pub fn delete_zone_policy(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute("DELETE FROM zone_policies WHERE id = ?1", params![id])
+                .context("delete zone policy")?;
+            Ok(n > 0)
+        })
+    }
+
+    // ============================================================================
+    // 运行时 SYN Flood 防护配置（`syn_flood_config` 单行）
+    // ============================================================================
+
+    /// 读取 SYN Flood 防护配置（无行则返回默认）。
+    pub fn load_syn_flood(&self) -> Result<SynFloodRow> {
+        self.with_conn(|c| {
+            let row = c
+                .query_row(
+                    "SELECT rate_pps, burst, max_half_open FROM syn_flood_config WHERE id = 1",
+                    [],
+                    |r| {
+                        Ok(SynFloodRow {
+                            rate_pps: r.get::<_, i64>(0)? as u32,
+                            burst: r.get::<_, i64>(1)? as u32,
+                            max_half_open: r.get::<_, i64>(2)? as u32,
+                        })
+                    },
+                )
+                .optional()
+                .context("load syn_flood config")?;
+            Ok(row.unwrap_or(SynFloodRow {
+                rate_pps: 0,
+                burst: 100,
+                max_half_open: 0,
+            }))
+        })
+    }
+
+    /// 写入（upsert）SYN Flood 防护配置（单行）。
+    pub fn save_syn_flood(&self, row: &SynFloodRow) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO syn_flood_config (id, rate_pps, burst, max_half_open)
+                 VALUES (1, ?1, ?2, ?3)",
+                params![row.rate_pps as i64, row.burst as i64, row.max_half_open as i64],
+            )
+            .context("save syn_flood config")?;
+            Ok(())
+        })
+    }
+
+    /// 交换两条规则的执行顺序：将两条记录的 id 互换（id 即执行顺序）。
+    ///
+    /// `table`/`id_col` 指向规则表主键列；两行必须在同一表中且均存在。
+    pub fn swap_ids(&self, table: &str, id_col: &str, id_a: i64, id_b: i64) -> Result<bool> {
+        if id_a == id_b {
+            return Ok(false);
+        }
+        self.with_conn(|c| {
+            c.execute("BEGIN IMMEDIATE", [])
+                .context("begin swap transaction")?;
+            let exists_a: bool = c
+                .query_row(
+                    &format!("SELECT 1 FROM {table} WHERE {id_col} = ?1"),
+                    params![id_a],
+                    |_| Ok(true),
+                )
+                .optional()
+                .context("check id_a")?
+                .unwrap_or(false);
+            let exists_b: bool = c
+                .query_row(
+                    &format!("SELECT 1 FROM {table} WHERE {id_col} = ?1"),
+                    params![id_b],
+                    |_| Ok(true),
+                )
+                .optional()
+                .context("check id_b")?
+                .unwrap_or(false);
+            if !exists_a || !exists_b {
+                c.execute("ROLLBACK", []).ok();
+                return Ok(false);
+            }
+            // 先移到负数临时值，避免唯一约束冲突。
+            c.execute(
+                &format!("UPDATE {table} SET {id_col} = -1 WHERE {id_col} = ?1"),
+                params![id_a],
+            )
+            .context("swap step 1")?;
+            c.execute(
+                &format!("UPDATE {table} SET {id_col} = ?1 WHERE {id_col} = ?2"),
+                params![id_a, id_b],
+            )
+            .context("swap step 2")?;
+            c.execute(
+                &format!("UPDATE {table} SET {id_col} = ?1 WHERE {id_col} = -1"),
+                params![id_b],
+            )
+            .context("swap step 3")?;
+            c.execute("COMMIT", []).context("commit swap")?;
+            Ok(true)
         })
     }
 }

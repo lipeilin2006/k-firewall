@@ -13,12 +13,12 @@ use k_firewall_common::maps::{
     CT_STATE_TCP_FIN_WAIT, CT_STATE_TCP_SYN_RECV, CT_STATE_TCP_SYN_SENT, CT_STATE_TCP_TIME_WAIT,
     CT_STATE_UDP, ConnLimit, CtValue, DnatKey, DnatValue, FAMILY_IPV4, FRAG_POLICY_DROP,
     FRAG_POLICY_INSPECT, FiveTuple, FragKey, IpKey, QosBucket, QosConfig, RateState,
-    SESSION_BLOCKED, SESSION_DROP, SESSION_NEW, SessionEvent, VifConfig, VifKey,
+    SESSION_BLOCKED, SESSION_DROP, SESSION_NEW, SessionEvent, VifConfig, VifKey, ZoneEntry,
 };
 use k_firewall_common::{
     BLOCKED_MARKER, CONFIG_DEFAULT_ACTION, CONFIG_FRAG_TIMEOUT, CONFIG_FRAGMENT_POLICY,
     CONFIG_FTP_ALG, CONFIG_QOS_COUNT, CONFIG_RA_FILTER, CONFIG_SURICATA_PREFILTER,
-    CONFIG_SYN_BURST, CONFIG_SYN_MAX_HALFOPEN, CONFIG_SYN_RATE, Stats,
+    CONFIG_SYN_BURST, CONFIG_SYN_MAX_HALFOPEN, CONFIG_SYN_RATE, CONFIG_ZONE_COUNT, Stats,
 };
 use serde::Deserialize;
 use tokio::io::AsyncBufReadExt as _;
@@ -180,6 +180,14 @@ pub struct EbpfHandle {
     qos_classes: Array<MapData, QosConfig>,
     /// QoS 每类入口限速桶（`QOS_BUCKETS`，per-CPU）。
     qos_buckets: PerCpuArray<MapData, QosBucket>,
+    /// Zone 策略数组（`ZONE`，长度固定 `ZONE_MAX`）：运行时按 id 顺序热同步。
+    zone: Array<MapData, ZoneEntry>,
+    /// 源 IP 速率限制（`RATE_LIMITS`，LRU 哈希）：运行时热同步。
+    rate_limits: HashMap<MapData, IpKey, RateState>,
+    /// 每源并发连接数上限（`CONN_LIMITS`）：运行时热同步。
+    conn_limits: HashMap<MapData, IpKey, ConnLimit>,
+    /// 端口转发 DNAT（`DNAT_RULES`）：运行时热同步。
+    dnat_rules: HashMap<MapData, DnatKey, DnatValue>,
 }
 
 /// 会话的应用层元数据（来自 Suricata eve 事件）。
@@ -370,7 +378,7 @@ fn spawn_session_logger(map: Map, cfg: &SessionLog) {
 }
 
 /// 通过 /sys/class/net 解析接口索引。
-fn if_index(name: &str) -> Option<i32> {
+pub(crate) fn if_index(name: &str) -> Option<i32> {
     std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
         .ok()?
         .trim()
@@ -639,25 +647,39 @@ impl EbpfHandle {
             }
         }
 
-        // 下发 Zone 策略（LpmTrie）：key = [src_ifindex(4B), dst_ip(4B)]，prefix = 32 + 掩码位数。
-        let mut zone_map: LpmTrie<_, [u8; 8], u8> =
-            LpmTrie::try_from(ebpf.take_map("ZONE").context("ZONE map not found")?)?;
-        for (phy, dst_net, prefix_len, action) in config.zone_entries() {
+        // 下发 Zone 策略（有序数组）：按配置顺序（等价 id 升序）写入 `ZONE`，
+        // eBPF 从 0 起顺序遍历、首匹配生效（id 顺序即执行顺序）。
+        let mut zone: Array<_, ZoneEntry> =
+            Array::try_from(ebpf.take_map("ZONE").context("ZONE map not found")?)?;
+        let zone_entries = config.zone_entries();
+        for (i, (phy, dst_net, prefix_len, action)) in zone_entries.iter().enumerate() {
             let idx = if_index(&phy)
                 .with_context(|| format!("zone: cannot resolve ifindex for {}", phy))?;
-            let mut data = [0u8; 8];
-            data[0..4].copy_from_slice(&(idx as u32).to_be_bytes());
-            data[4..8].copy_from_slice(&dst_net.to_be_bytes());
-            let key = LpmKey::new(32 + prefix_len, data);
-            zone_map.insert(&key, action, 0)?;
+            zone.set(
+                i as u32,
+                ZoneEntry::from_ipv4(idx as u32, *dst_net, *prefix_len as u8, *action),
+                0,
+            )?;
             info!(
-                "ZONE src={} (ifindex={}) dst_net={:?}/{} action={}",
-                phy, idx, dst_net, prefix_len, action
+                "ZONE[{}] src={} (ifindex={}) dst_net={:?}/{} action={}",
+                i, phy, idx, dst_net, prefix_len, action
             );
+        }
+        {
+            // 重新获取 CONFIG map：避免跨多个 take_map 的借用冲突。
+            let mut config_map: Array<_, u32> = Array::try_from(
+                ebpf.map_mut("CONFIG").context("CONFIG map not found")?,
+            )?;
+            config_map.set(
+                CONFIG_ZONE_COUNT,
+                zone_entries.len().min(k_firewall_common::maps::ZONE_MAX as usize) as u32,
+                0,
+            )?;
         }
 
         // 下发 DNAT 规则（端口转发）：key=(WAN IP:端口, proto) -> 内部服务器。
-        let mut dnat_map: HashMap<_, DnatKey, DnatValue> = HashMap::try_from(
+        // 句柄常驻，运行时热同步（WebAPI /nat/rules 增删改）复用。
+        let mut dnat_rules: HashMap<_, DnatKey, DnatValue> = HashMap::try_from(
             ebpf.take_map("DNAT_RULES")
                 .context("DNAT_RULES map not found")?,
         )?;
@@ -668,7 +690,7 @@ impl EbpfHandle {
                 dnat.proto_u8().expect("config validated"),
             );
             let value = DnatValue::from_ipv4(u32::from(dnat.to_ip), dnat.to_port.to_be());
-            dnat_map.insert(key, value, 0)?;
+            dnat_rules.insert(key, value, 0)?;
             info!(
                 "DNAT[{}] {}:{} {} -> {}:{}",
                 i, dnat.dst_ip, dnat.dst_port, dnat.proto, dnat.to_ip, dnat.to_port
@@ -676,7 +698,8 @@ impl EbpfHandle {
         }
 
         // 源 IP 速率限制：预填令牌桶条目（LRU map，未配置的源 IP 不设限速）。
-        let mut rate_map: HashMap<_, IpKey, RateState> = HashMap::try_from(
+        // 句柄常驻，运行时热同步（WebAPI /security/rate-limits）复用。
+        let mut rate_limits: HashMap<_, IpKey, RateState> = HashMap::try_from(
             ebpf.take_map("RATE_LIMITS")
                 .context("RATE_LIMITS map not found")?,
         )?;
@@ -685,7 +708,7 @@ impl EbpfHandle {
                 IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
                 IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
             };
-            rate_map.insert(key, RateState::new(rl.rate, rl.burst), 0)?;
+            rate_limits.insert(key, RateState::new(rl.rate, rl.burst), 0)?;
             info!(
                 "RATE LIMIT {}: {} pps burst {}",
                 rl.src_ip, rl.rate, rl.burst
@@ -693,7 +716,8 @@ impl EbpfHandle {
         }
 
         // 每源 IP 并发连接数上限：预填 CONN_LIMITS（未配置的源 IP 不限制）。
-        let mut conn_map: HashMap<_, IpKey, ConnLimit> = HashMap::try_from(
+        // 句柄常驻，运行时热同步（WebAPI /security/conn-limits）复用。
+        let mut conn_limits: HashMap<_, IpKey, ConnLimit> = HashMap::try_from(
             ebpf.take_map("CONN_LIMITS")
                 .context("CONN_LIMITS map not found")?,
         )?;
@@ -702,7 +726,7 @@ impl EbpfHandle {
                 IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
                 IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
             };
-            conn_map.insert(
+            conn_limits.insert(
                 key,
                 ConnLimit {
                     max_conns: cl.max_conns,
@@ -779,6 +803,10 @@ impl EbpfHandle {
             ct_timeouts: timeouts,
             qos_classes,
             qos_buckets,
+            zone,
+            rate_limits,
+            conn_limits,
+            dnat_rules,
         })
     }
 
@@ -869,6 +897,98 @@ impl EbpfHandle {
             count,
             k_firewall_common::maps::QOS_MAX,
             count
+        );
+        Ok(())
+    }
+
+    /// 全量同步 Zone 策略：按传入顺序（id 升序）写入 `ZONE` 数组并更新
+    /// `CONFIG_ZONE_COUNT`。原子重同步：先置 COUNT=0 停用遍历，清空数组后
+    /// 写入全部条目，最后恢复 COUNT，避免 eBPF 读到半新半旧的策略。
+    pub fn sync_zone_policies(&mut self, entries: &[ZoneEntry]) -> Result<()> {
+        let count = entries.len().min(k_firewall_common::maps::ZONE_MAX as usize);
+        let mut config_map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
+        )?;
+        config_map.set(CONFIG_ZONE_COUNT, 0, 0)?;
+        let zero = ZoneEntry::from_ipv4(0, 0, 0, k_firewall_common::DEFAULT_ACTION);
+        for i in 0..k_firewall_common::maps::ZONE_MAX {
+            self.zone.set(i, zero, 0)?;
+        }
+        for (i, entry) in entries.iter().enumerate().take(count) {
+            self.zone.set(i as u32, *entry, 0)?;
+        }
+        config_map.set(CONFIG_ZONE_COUNT, count as u32, 0)?;
+        info!(
+            "ZONE synced: {} entries (max {}), CONFIG_ZONE_COUNT={}",
+            count,
+            k_firewall_common::maps::ZONE_MAX,
+            count
+        );
+        Ok(())
+    }
+
+    /// 全量同步源 IP 速率限制：清空 `RATE_LIMITS` 后写入全部条目。
+    ///
+    /// 原子重同步：先遍历清空旧条目，再逐个插入（LRU 表，key 唯一）。
+    pub fn sync_rate_limit_entries(&mut self, entries: &[(IpKey, u32, u32)]) -> Result<()> {
+        let keys: Vec<IpKey> = self.rate_limits.keys().filter_map(|r| r.ok()).collect();
+        for k in &keys {
+            let _ = self.rate_limits.remove(k);
+        }
+        for (key, rate, burst) in entries {
+            self.rate_limits.insert(*key, RateState::new(*rate, *burst), 0)?;
+        }
+        info!("RATE_LIMITS synced: {} entries", entries.len());
+        Ok(())
+    }
+
+    /// 全量同步每源并发连接数上限：清空 `CONN_LIMITS` 后写入全部条目。
+    pub fn sync_conn_limits(&mut self, entries: &[(IpKey, u32)]) -> Result<()> {
+        let keys: Vec<IpKey> = self.conn_limits.keys().filter_map(|r| r.ok()).collect();
+        for k in &keys {
+            let _ = self.conn_limits.remove(k);
+        }
+        for (key, max_conns) in entries {
+            self.conn_limits.insert(
+                *key,
+                ConnLimit {
+                    max_conns: *max_conns,
+                },
+                0,
+            )?;
+        }
+        info!("CONN_LIMITS synced: {} entries", entries.len());
+        Ok(())
+    }
+
+    /// 全量同步 DNAT 端口转发规则：清空 `DNAT_RULES` 后写入全部条目。
+    pub fn sync_dnat_rules(&mut self, entries: &[(DnatKey, DnatValue)]) -> Result<()> {
+        let keys: Vec<DnatKey> = self.dnat_rules.keys().filter_map(|r| r.ok()).collect();
+        for k in &keys {
+            let _ = self.dnat_rules.remove(k);
+        }
+        for (key, value) in entries {
+            self.dnat_rules.insert(*key, *value, 0)?;
+        }
+        info!("DNAT_RULES synced: {} entries", entries.len());
+        Ok(())
+    }
+
+    /// 同步 SYN Flood 全局防护配置（`CONFIG_SYN_*` 槽位）。
+    pub fn sync_syn_flood(&mut self, rate_pps: u32, burst: u32, max_half_open: u32) -> Result<()> {
+        let mut config_map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
+        )?;
+        config_map.set(CONFIG_SYN_RATE, rate_pps, 0)?;
+        config_map.set(CONFIG_SYN_BURST, burst, 0)?;
+        config_map.set(CONFIG_SYN_MAX_HALFOPEN, max_half_open, 0)?;
+        info!(
+            "SYN_FLOOD synced: rate={} burst={} half_open={}",
+            rate_pps, burst, max_half_open
         );
         Ok(())
     }

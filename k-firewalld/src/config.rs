@@ -57,7 +57,7 @@ impl DnatRule {
 }
 
 /// 计算 IPv4 掩码的前缀位数（255.255.255.0 -> 24）。
-fn mask_bits(mask: Ipv4Addr) -> u32 {
+pub(crate) fn mask_bits(mask: Ipv4Addr) -> u32 {
     u32::from(mask).count_ones()
 }
 

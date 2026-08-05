@@ -332,11 +332,252 @@ pub fn openapi_doc() -> Value {
                     }
                 }
             },
-            "/status": {
+            "/api/v1/security/rate-limits": {
                 "get": {
-                    "summary": "运行状态",
-                    "operationId": "getStatus",
-                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" } } } } }
+                    "summary": "列出全部源 IP 速率限制规则",
+                    "operationId": "listRateLimits",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitListOut" } } } } }
+                },
+                "post": {
+                    "summary": "新增一条源 IP 速率限制规则（id 可自定；缺省自动分配）",
+                    "operationId": "addRateLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitRequest" } } } },
+                    "responses": {
+                        "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitOut" } } } },
+                        "400": { "description": "校验失败（重复 src_ip / id 冲突 / rate=0）" }
+                    }
+                },
+                "delete": {
+                    "summary": "批量删除速率限制规则（body 传 ids 数组）",
+                    "operationId": "deleteRateLimits",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitDeleteRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "integer" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/RateLimitOut" } } } } } } } }
+                }
+            },
+            "/api/v1/security/rate-limits/swap": {
+                "post": {
+                    "summary": "交换两条速率限制规则的执行顺序（互换 DB id 后全量重同步）",
+                    "operationId": "swapRateLimits",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderSwapRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "swapped": { "type": "boolean" }, "a": { "$ref": "#/components/schemas/RateLimitOut" }, "b": { "$ref": "#/components/schemas/RateLimitOut" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/RateLimitOut" } } } } } } } }
+                }
+            },
+            "/api/v1/security/rate-limits/{id}": {
+                "delete": {
+                    "summary": "按 id 删除一条速率限制规则",
+                    "operationId": "deleteRateLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "boolean" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/RateLimitOut" } } } } } } } }
+                },
+                "patch": {
+                    "summary": "部分更新一条速率限制规则（启停）",
+                    "operationId": "patchRateLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassPatchRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitOut" } } } } }
+                },
+                "put": {
+                    "summary": "原地替换一条速率限制规则",
+                    "operationId": "updateRateLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitUpdateRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RateLimitOut" } } } } }
+                }
+            },
+            "/api/v1/security/conn-limits": {
+                "get": {
+                    "summary": "列出全部每源并发连接数限制规则",
+                    "operationId": "listConnLimits",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitListOut" } } } } }
+                },
+                "post": {
+                    "summary": "新增一条每源并发连接数限制规则（id 可自定）",
+                    "operationId": "addConnLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitOut" } } } } }
+                },
+                "delete": {
+                    "summary": "批量删除并发连接数限制规则（body 传 ids 数组）",
+                    "operationId": "deleteConnLimits",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitDeleteRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "integer" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ConnLimitOut" } } } } } } } }
+                }
+            },
+            "/api/v1/security/conn-limits/swap": {
+                "post": {
+                    "summary": "交换两条并发连接数限制规则的执行顺序",
+                    "operationId": "swapConnLimits",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderSwapRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "swapped": { "type": "boolean" }, "a": { "$ref": "#/components/schemas/ConnLimitOut" }, "b": { "$ref": "#/components/schemas/ConnLimitOut" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ConnLimitOut" } } } } } } } }
+                }
+            },
+            "/api/v1/security/conn-limits/{id}": {
+                "delete": {
+                    "summary": "按 id 删除一条并发连接数限制规则",
+                    "operationId": "deleteConnLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "boolean" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ConnLimitOut" } } } } } } } }
+                },
+                "patch": {
+                    "summary": "部分更新一条并发连接数限制规则（启停）",
+                    "operationId": "patchConnLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassPatchRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitOut" } } } } }
+                },
+                "put": {
+                    "summary": "原地替换一条并发连接数限制规则",
+                    "operationId": "updateConnLimit",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitUpdateRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ConnLimitOut" } } } } }
+                }
+            },
+            "/api/v1/security/syn-flood": {
+                "get": {
+                    "summary": "读取 SYN Flood 防护全局配置",
+                    "operationId": "getSynFlood",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SynFloodOut" } } } } }
+                },
+                "put": {
+                    "summary": "整体替换 SYN Flood 防护全局配置（热同步 CONFIG_SYN_*）",
+                    "operationId": "putSynFlood",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SynFloodRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SynFloodOut" } } } } }
+                }
+            },
+            "/api/v1/nat/rules": {
+                "get": {
+                    "summary": "列出全部 DNAT 端口转发规则",
+                    "operationId": "listNatRules",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleListOut" } } } } }
+                },
+                "post": {
+                    "summary": "新增一条 DNAT 端口转发规则（id 可自定）",
+                    "operationId": "addNatRule",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleRequest" } } } },
+                    "responses": {
+                        "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleOut" } } } },
+                        "400": { "description": "校验失败（IP 非法 / 端口为 0 / proto 非 tcp|udp）" }
+                    }
+                },
+                "delete": {
+                    "summary": "批量删除 DNAT 规则（body 传 ids 数组）",
+                    "operationId": "deleteNatRules",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleDeleteRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "integer" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/NatRuleOut" } } } } } } } }
+                }
+            },
+            "/api/v1/nat/rules/swap": {
+                "post": {
+                    "summary": "交换两条 DNAT 规则的执行顺序",
+                    "operationId": "swapNatRules",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderSwapRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "swapped": { "type": "boolean" }, "a": { "$ref": "#/components/schemas/NatRuleOut" }, "b": { "$ref": "#/components/schemas/NatRuleOut" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/NatRuleOut" } } } } } } } }
+                }
+            },
+            "/api/v1/nat/rules/{id}": {
+                "delete": {
+                    "summary": "按 id 删除一条 DNAT 规则",
+                    "operationId": "deleteNatRule",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "boolean" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/NatRuleOut" } } } } } } } }
+                },
+                "patch": {
+                    "summary": "部分更新一条 DNAT 规则（启停）",
+                    "operationId": "patchNatRule",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassPatchRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleOut" } } } } }
+                },
+                "put": {
+                    "summary": "原地替换一条 DNAT 规则",
+                    "operationId": "updateNatRule",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleUpdateRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NatRuleOut" } } } } }
+                }
+            },
+            "/api/v1/zones": {
+                "get": {
+                    "summary": "列出全部 Zone 策略（id 升序；id 顺序即执行顺序）",
+                    "operationId": "listZonePolicies",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyListOut" } } } } }
+                },
+                "post": {
+                    "summary": "新增一条 Zone 策略（id 可自定；首匹配生效）",
+                    "operationId": "addZonePolicy",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyRequest" } } } },
+                    "responses": {
+                        "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyOut" } } } },
+                        "400": { "description": "校验失败（未知接口 / action 非 accept|drop / id 冲突）" }
+                    }
+                },
+                "delete": {
+                    "summary": "批量删除 Zone 策略（body 传 ids 数组）",
+                    "operationId": "deleteZonePolicies",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyDeleteRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "integer" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ZonePolicyOut" } } } } } } } }
+                }
+            },
+            "/api/v1/zones/swap": {
+                "post": {
+                    "summary": "交换两条 Zone 策略的执行顺序",
+                    "operationId": "swapZonePolicies",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OrderSwapRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "swapped": { "type": "boolean" }, "a": { "$ref": "#/components/schemas/ZonePolicyOut" }, "b": { "$ref": "#/components/schemas/ZonePolicyOut" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ZonePolicyOut" } } } } } } } }
+                }
+            },
+            "/api/v1/zones/{id}": {
+                "delete": {
+                    "summary": "按 id 删除一条 Zone 策略",
+                    "operationId": "deleteZonePolicy",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "boolean" }, "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ZonePolicyOut" } } } } } } } }
+                },
+                "patch": {
+                    "summary": "部分更新一条 Zone 策略（启停）",
+                    "operationId": "patchZonePolicy",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassPatchRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyOut" } } } } }
+                },
+                "put": {
+                    "summary": "原地替换一条 Zone 策略",
+                    "operationId": "updateZonePolicy",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyUpdateRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ZonePolicyOut" } } } } }
                 }
             },
             "/stats": {
@@ -675,6 +916,193 @@ pub fn openapi_doc() -> Value {
                     }
                 },
                 "QosClassDeleteRequest": {
+                    "type": "object",
+                    "properties": { "ids": { "type": "array", "items": { "type": "integer", "format": "int64" } } }
+                },
+                "OrderSwapRequest": {
+                    "type": "object",
+                    "required": ["id_a", "id_b"],
+                    "properties": {
+                        "id_a": { "type": "integer", "format": "int64" },
+                        "id_b": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "RateLimitOut": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "src_ip": { "type": "string" },
+                        "rate": { "type": "integer", "format": "int64" },
+                        "burst": { "type": "integer", "format": "int64" },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "RateLimitRequest": {
+                    "type": "object",
+                    "required": ["src_ip", "rate"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "src_ip": { "type": "string" },
+                        "rate": { "type": "integer", "format": "int64" },
+                        "burst": { "type": "integer", "format": "int64", "default": 1000 }
+                    }
+                },
+                "RateLimitUpdateRequest": {
+                    "type": "object",
+                    "required": ["src_ip", "rate"],
+                    "properties": {
+                        "src_ip": { "type": "string" },
+                        "rate": { "type": "integer", "format": "int64" },
+                        "burst": { "type": "integer", "format": "int64", "default": 1000 }
+                    }
+                },
+                "RateLimitListOut": {
+                    "type": "object",
+                    "properties": {
+                        "total": { "type": "integer", "format": "int64" },
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/RateLimitOut" } }
+                    }
+                },
+                "RateLimitDeleteRequest": {
+                    "type": "object",
+                    "properties": { "ids": { "type": "array", "items": { "type": "integer", "format": "int64" } } }
+                },
+                "ConnLimitOut": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "src_ip": { "type": "string" },
+                        "max_conns": { "type": "integer", "format": "int64" },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "ConnLimitRequest": {
+                    "type": "object",
+                    "required": ["src_ip", "max_conns"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "src_ip": { "type": "string" },
+                        "max_conns": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "ConnLimitUpdateRequest": {
+                    "type": "object",
+                    "required": ["src_ip", "max_conns"],
+                    "properties": {
+                        "src_ip": { "type": "string" },
+                        "max_conns": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "ConnLimitListOut": {
+                    "type": "object",
+                    "properties": {
+                        "total": { "type": "integer", "format": "int64" },
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ConnLimitOut" } }
+                    }
+                },
+                "ConnLimitDeleteRequest": {
+                    "type": "object",
+                    "properties": { "ids": { "type": "array", "items": { "type": "integer", "format": "int64" } } }
+                },
+                "SynFloodOut": {
+                    "type": "object",
+                    "properties": {
+                        "rate_pps": { "type": "integer", "format": "int64" },
+                        "burst": { "type": "integer", "format": "int64" },
+                        "max_half_open": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "SynFloodRequest": {
+                    "type": "object",
+                    "properties": {
+                        "rate_pps": { "type": "integer", "format": "int64", "default": 0 },
+                        "burst": { "type": "integer", "format": "int64", "default": 100 },
+                        "max_half_open": { "type": "integer", "format": "int64", "default": 0 }
+                    }
+                },
+                "NatRuleOut": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "dst_ip": { "type": "string" },
+                        "dst_port": { "type": "integer", "format": "int32" },
+                        "proto": { "type": "string", "enum": ["tcp", "udp"] },
+                        "to_ip": { "type": "string" },
+                        "to_port": { "type": "integer", "format": "int32" },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "NatRuleRequest": {
+                    "type": "object",
+                    "required": ["dst_ip", "dst_port", "to_ip", "to_port"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "dst_ip": { "type": "string" },
+                        "dst_port": { "type": "integer", "format": "int32" },
+                        "proto": { "type": "string", "enum": ["tcp", "udp"], "default": "tcp" },
+                        "to_ip": { "type": "string" },
+                        "to_port": { "type": "integer", "format": "int32" }
+                    }
+                },
+                "NatRuleUpdateRequest": {
+                    "type": "object",
+                    "required": ["dst_ip", "dst_port", "to_ip", "to_port"],
+                    "properties": {
+                        "dst_ip": { "type": "string" },
+                        "dst_port": { "type": "integer", "format": "int32" },
+                        "proto": { "type": "string", "enum": ["tcp", "udp"], "default": "tcp" },
+                        "to_ip": { "type": "string" },
+                        "to_port": { "type": "integer", "format": "int32" }
+                    }
+                },
+                "NatRuleListOut": {
+                    "type": "object",
+                    "properties": {
+                        "total": { "type": "integer", "format": "int64" },
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/NatRuleOut" } }
+                    }
+                },
+                "NatRuleDeleteRequest": {
+                    "type": "object",
+                    "properties": { "ids": { "type": "array", "items": { "type": "integer", "format": "int64" } } }
+                },
+                "ZonePolicyOut": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "src_interface": { "type": "string" },
+                        "dst_interface": { "type": "string" },
+                        "action": { "type": "string", "enum": ["accept", "drop"] },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "ZonePolicyRequest": {
+                    "type": "object",
+                    "required": ["src_interface", "dst_interface", "action"],
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "src_interface": { "type": "string" },
+                        "dst_interface": { "type": "string" },
+                        "action": { "type": "string", "enum": ["accept", "drop"] }
+                    }
+                },
+                "ZonePolicyUpdateRequest": {
+                    "type": "object",
+                    "required": ["src_interface", "dst_interface", "action"],
+                    "properties": {
+                        "src_interface": { "type": "string" },
+                        "dst_interface": { "type": "string" },
+                        "action": { "type": "string", "enum": ["accept", "drop"] }
+                    }
+                },
+                "ZonePolicyListOut": {
+                    "type": "object",
+                    "properties": {
+                        "total": { "type": "integer", "format": "int64" },
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/ZonePolicyOut" } }
+                    }
+                },
+                "ZonePolicyDeleteRequest": {
                     "type": "object",
                     "properties": { "ids": { "type": "array", "items": { "type": "integer", "format": "int64" } } }
                 },

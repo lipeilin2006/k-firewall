@@ -577,6 +577,48 @@ pub struct AlgExpect {
 }
 
 // ============================================================================
+// Zone 策略（有序数组条目）
+// ============================================================================
+/// Zone 策略最大条目数（`ZONE` 数组长度）。
+///
+/// 受 eBPF verifier 循环展开限制，数组不宜过大；64 条覆盖全部接口对（每条策略
+/// 展开为 src→dst 与 dst→src 两条）仍绰绰有余。
+pub const ZONE_MAX: u32 = 64;
+
+/// `ZONE` 值：单条 Zone 策略（有序数组，首匹配生效）。
+///
+/// daemon 将策略按 id 升序写入 `ZONE` 数组（下标即执行顺序），eBPF 从 0 起
+/// 顺序遍历，首个匹配 `(src_ifindex, dst 网段)` 的条目动作生效。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneEntry {
+    /// 入向物理网卡 ifindex；0 = 任意接口。
+    pub src_ifindex: u32,
+    /// 目的网段（网络序字节，IPv4 前 4 字节）。
+    pub dst_net: [u8; 16],
+    /// 目的前缀长度（0 = 0.0.0.0/0 任意目的）。
+    pub prefix_len: u8,
+    /// `ACTION_DROP` / `ACTION_PASS`。
+    pub action: u8,
+    /// 对齐填充。
+    pub _pad: [u8; 2],
+}
+
+impl ZoneEntry {
+    pub fn from_ipv4(src_ifindex: u32, dst_net: u32, prefix_len: u8, action: u8) -> Self {
+        let mut d = [0u8; 16];
+        d[0..4].copy_from_slice(&dst_net.to_be_bytes());
+        Self {
+            src_ifindex,
+            dst_net: d,
+            prefix_len,
+            action,
+            _pad: [0; 2],
+        }
+    }
+}
+
+// ============================================================================
 // aya::Pod（用户态 feature）
 // ============================================================================
 #[cfg(feature = "user")]
@@ -623,3 +665,6 @@ unsafe impl aya::Pod for SynState {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for AlgExpect {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for ZoneEntry {}
