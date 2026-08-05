@@ -172,7 +172,7 @@ impl Config {
             bail!("fragment_timeout_secs must be > 0");
         }
 
-        // 接口名唯一（QoS 的 ingress_iface / shaping.interface 引用据此校验）。
+        // 接口名唯一（QoS 的 ingress_iface 引用据此校验）。
         let mut names: HashSet<&str> = HashSet::new();
         for (i, ifc) in self.interfaces.iter().enumerate() {
             if !names.insert(ifc.name.as_str()) {
@@ -192,15 +192,6 @@ impl Config {
                 if !names.contains(iface.as_str()) {
                     bail!("qos.classes[{i}]: unknown ingress_iface {iface:?}");
                 }
-            }
-        }
-        for (i, s) in self.qos.shaping.iter().enumerate() {
-            if !names.contains(s.interface.as_str()) {
-                bail!("qos.shaping[{i}]: unknown interface {:?}", s.interface);
-            }
-            for (j, c) in s.classes.iter().enumerate() {
-                c.validate()
-                    .with_context(|| format!("qos.shaping[{i}].classes[{j}]"))?;
             }
         }
         // peer 必须引用已存在接口。
@@ -871,15 +862,12 @@ impl Default for Ipv6 {
 pub struct Qos {
     /// XDP 分类：DSCP 标记 + 每类入口限速（首匹配生效）。
     pub classes: Vec<QosClass>,
-    /// 出口整形（HTB，按 DSCP 分类），可多个接口。
-    pub shaping: Vec<QosShaping>,
 }
 
 impl Default for Qos {
     fn default() -> Self {
         Self {
             classes: Vec::new(),
-            shaping: Vec::new(),
         }
     }
 }
@@ -940,81 +928,6 @@ impl QosClass {
             bail!("qos class {:?}: dscp out of range 0..63", self.name);
         }
         self.proto_u8()?;
-        Ok(())
-    }
-}
-
-/// 出口整形（HTB）配置。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct QosShaping {
-    /// 逻辑接口名（route 模式出口 / 入向限速）。
-    pub interface: String,
-    /// 默认 classid（如 "1:10"）。
-    pub default_classid: String,
-    pub classes: Vec<QosShapingClass>,
-}
-
-impl Default for QosShaping {
-    fn default() -> Self {
-        Self {
-            interface: String::new(),
-            default_classid: "1:10".into(),
-            classes: Vec::new(),
-        }
-    }
-}
-
-/// HTB 整形类。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct QosShapingClass {
-    /// classid（如 "1:10"）。
-    pub classid: String,
-    /// 匹配的 DSCP。
-    pub dscp: u8,
-    /// 保证带宽（字节/秒）。
-    pub rate_bps: u64,
-    /// 上限带宽（字节/秒）。
-    pub ceil_bps: u64,
-    /// 突发字节。
-    pub burst_bytes: u32,
-}
-
-impl Default for QosShapingClass {
-    fn default() -> Self {
-        Self {
-            classid: String::new(),
-            dscp: 0,
-            rate_bps: 0,
-            ceil_bps: 0,
-            burst_bytes: 16000,
-        }
-    }
-}
-
-impl QosShapingClass {
-    fn validate(&self) -> Result<()> {
-        if self.classid.is_empty() {
-            bail!("qos shaping: classid is required");
-        }
-        if self.dscp > 63 {
-            bail!(
-                "qos shaping class {}: dscp out of range 0..63",
-                self.classid
-            );
-        }
-        if self.rate_bps == 0 {
-            bail!("qos shaping class {}: rate_bps must be > 0", self.classid);
-        }
-        if self.ceil_bps != 0 && self.ceil_bps < self.rate_bps {
-            bail!(
-                "qos shaping class {}: ceil_bps ({}) < rate_bps ({})",
-                self.classid,
-                self.ceil_bps,
-                self.rate_bps
-            );
-        }
         Ok(())
     }
 }

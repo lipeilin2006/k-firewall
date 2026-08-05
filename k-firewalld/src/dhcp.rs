@@ -173,7 +173,7 @@ impl IfaceServer {
 
     /// 分配一个当前未被占用的池内地址。
     fn alloc_addr(&self, now: std::time::Instant) -> Ipv6Addr {
-        let mut guard = self.leases.lock().unwrap();
+        let guard = self.leases.lock().unwrap();
         let mut offset = *self.next_offset.lock().unwrap();
         // 扫描上限：池远大于实际租约数，碰到已占用就线性探测，最多扫 4096 次。
         let scan_limit = self.host_count.min(4096);

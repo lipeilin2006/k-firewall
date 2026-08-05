@@ -39,6 +39,30 @@ pub struct BlocklistRow {
     pub expire_unix: Option<u64>,
 }
 
+/// 运行时 QoS 分类行（`qos_classes`）。
+#[derive(Debug, Clone)]
+pub struct QosClassRow {
+    pub id: Option<i64>,
+    /// 分类名（唯一，供展示）。
+    pub name: String,
+    /// 目标 DSCP（0-63）。
+    pub dscp: u8,
+    /// 入向接口逻辑名；空 = 任意接口。
+    pub ingress_iface: String,
+    /// 协议名（tcp|udp|icmp|icmp6|any）。
+    pub proto: String,
+    /// 源端口（0 = 任意）。
+    pub src_port: u16,
+    /// 目的端口（0 = 任意）。
+    pub dst_port: u16,
+    /// 每类入口限速（字节/秒）；0 = 不限速。
+    pub rate_bps: u64,
+    /// 桶容量（突发字节）。
+    pub burst_bytes: u32,
+    /// 是否启用。
+    pub enabled: bool,
+}
+
 impl Persist {
     /// 打开（必要时创建）数据库并建表。
     pub fn open(path: &Path) -> Result<Self> {
@@ -64,6 +88,18 @@ impl Persist {
                      reason      TEXT NOT NULL DEFAULT '',
                      added_unix  INTEGER NOT NULL,
                      expire_unix INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS qos_classes (
+                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name          TEXT NOT NULL,
+                     dscp          INTEGER NOT NULL DEFAULT 0,
+                     ingress_iface TEXT NOT NULL DEFAULT '',
+                     proto         TEXT NOT NULL DEFAULT 'any',
+                     src_port      INTEGER NOT NULL DEFAULT 0,
+                     dst_port      INTEGER NOT NULL DEFAULT 0,
+                     rate_bps      INTEGER NOT NULL DEFAULT 0,
+                     burst_bytes   INTEGER NOT NULL DEFAULT 16000,
+                     enabled       INTEGER NOT NULL DEFAULT 1
                  );",
             )
             .context("init schema")?;
@@ -276,6 +312,122 @@ impl Persist {
                 params![ip.to_string()],
             )
             .context("delete blocklist")?;
+            Ok(())
+        })
+    }
+
+    /// 读取全部 QoS 分类（按 id 升序）。
+    pub fn load_qos_classes(&self) -> Result<Vec<QosClassRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT id, name, dscp, ingress_iface, proto, src_port, dst_port,
+                            rate_bps, burst_bytes, enabled
+                     FROM qos_classes ORDER BY id",
+                )
+                .context("prepare load_qos_classes")?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(QosClassRow {
+                        id: Some(r.get(0)?),
+                        name: r.get(1)?,
+                        dscp: r.get::<_, i64>(2)? as u8,
+                        ingress_iface: r.get(3)?,
+                        proto: r.get(4)?,
+                        src_port: r.get::<_, i64>(5)? as u16,
+                        dst_port: r.get::<_, i64>(6)? as u16,
+                        rate_bps: r.get::<_, i64>(7)? as u64,
+                        burst_bytes: r.get::<_, i64>(8)? as u32,
+                        enabled: r.get(9)?,
+                    })
+                })
+                .context("query qos_classes")?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.context("read qos class row")?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 写入（insert）一条 QoS 分类，返回新 id。
+    pub fn insert_qos_class(&self, row: &QosClassRow) -> Result<i64> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO qos_classes
+                     (name, dscp, ingress_iface, proto, src_port, dst_port,
+                      rate_bps, burst_bytes, enabled)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.name,
+                    row.dscp as i64,
+                    row.ingress_iface,
+                    row.proto,
+                    row.src_port as i64,
+                    row.dst_port as i64,
+                    row.rate_bps as i64,
+                    row.burst_bytes as i64,
+                    row.enabled,
+                ],
+            )
+            .context("insert qos class")?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// 按 id 更新一条 QoS 分类（PUT 用）。
+    pub fn update_qos_class(&self, id: i64, row: &QosClassRow) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE qos_classes SET name=?1, dscp=?2, ingress_iface=?3, proto=?4,
+                            src_port=?5, dst_port=?6, rate_bps=?7, burst_bytes=?8
+                     WHERE id=?9",
+                    params![
+                        row.name,
+                        row.dscp as i64,
+                        row.ingress_iface,
+                        row.proto,
+                        row.src_port as i64,
+                        row.dst_port as i64,
+                        row.rate_bps as i64,
+                        row.burst_bytes as i64,
+                        id,
+                    ],
+                )
+                .context("update qos class")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 更新启用字段（PATCH 用）。
+    pub fn patch_qos_class(&self, id: i64, enabled: bool) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute(
+                    "UPDATE qos_classes SET enabled=?1 WHERE id=?2",
+                    params![enabled, id],
+                )
+                .context("patch qos class")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 按 id 删除一条 QoS 分类。
+    pub fn delete_qos_class(&self, id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c
+                .execute("DELETE FROM qos_classes WHERE id = ?1", params![id])
+                .context("delete qos class")?;
+            Ok(n > 0)
+        })
+    }
+
+    /// 清空全部 QoS 分类。
+    pub fn clear_qos_classes(&self) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute("DELETE FROM qos_classes", [])
+                .context("clear qos classes")?;
             Ok(())
         })
     }

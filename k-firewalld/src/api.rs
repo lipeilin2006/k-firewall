@@ -13,16 +13,18 @@ use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use k_firewall_common::BlockEntry;
 use k_firewall_common::api::{
     BlockRequest, BlockedEntryOut, BlockedOut, BlocklistEntryOut, BlocklistOut, ConfigDiffOut,
     ConfigRestoreOut, ConfigValidateOut, Error, InterfaceInfo, InterfaceStats, InterfaceStatsOut,
-    InterfacesOut, SessionDeleteRequest, SessionListQuery, SessionOut, SessionsDeleteOut,
-    SessionsOut, StatsOut, Status, SuricataPrefilterStats, SuricataRuleDeleteRequest,
-    SuricataRuleImportOut, SuricataRuleImportRequest, SuricataRuleListOut, SuricataRuleOut,
-    SuricataRulePatchRequest, SuricataRuleRequest, SuricataRuleUpdateRequest,
+    InterfacesOut, QosClassDeleteRequest, QosClassListOut, QosClassOut, QosClassPatchRequest,
+    QosClassRequest, QosClassUpdateRequest, SessionDeleteRequest, SessionListQuery, SessionOut,
+    SessionsDeleteOut, SessionsOut, StatsOut, Status, SuricataPrefilterStats,
+    SuricataRuleDeleteRequest, SuricataRuleImportOut, SuricataRuleImportRequest,
+    SuricataRuleListOut, SuricataRuleOut, SuricataRulePatchRequest, SuricataRuleRequest,
+    SuricataRuleUpdateRequest,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -50,6 +52,10 @@ pub struct AppState {
     pub suricata_rules: Mutex<Vec<crate::suricata_rules::SuriRule>>,
     /// 下一条 Suricata 规则 id（无持久化时使用）。
     pub next_suri_rule_id: AtomicU64,
+    /// 运行时 QoS 分类（SQLite 持久化，热同步 `QOS_CLASSES`）。
+    pub qos_classes: Mutex<Vec<crate::persist::QosClassRow>>,
+    /// 下一条 QoS 分类 id（无持久化时使用）。
+    pub next_qos_class_id: AtomicU64,
     /// `suricata.prefilter` 配置（XDP 规则头预过滤开关；可热改）。
     pub suricata_prefilter: AtomicBool,
     /// 运行时规则持久化（未配置 `daemon.db_path` 时为空）。
@@ -119,12 +125,43 @@ impl AppState {
             map
         };
 
+        // 恢复持久化的 QoS 分类并同步到 eBPF（QOS_CLASSES）。启动期间
+        // 同步失败仅告警：分类仍保留在内存/DB，运行时可重试。
+        let qos_classes = {
+            let mut rows = Vec::new();
+            if let Some(p) = &persist {
+                match p.load_qos_classes() {
+                    Ok(r) => rows = r,
+                    Err(e) => warn!("failed to load qos classes from db: {e:#}"),
+                }
+            }
+            rows
+        };
+        let mut next_qos_class_id = 1u64;
+        for r in &qos_classes {
+            if let Some(id) = r.id {
+                next_qos_class_id = next_qos_class_id.max(id as u64 + 1);
+            }
+        }
+        {
+            let entries: Vec<k_firewall_common::maps::QosConfig> = qos_classes
+                .iter()
+                .filter(|r| r.enabled)
+                .map(|r| qos_config_from_row(r, &config.interfaces))
+                .collect();
+            if let Err(e) = handle.sync_qos_classes(&entries) {
+                warn!("failed to sync qos classes to ebpf: {e:#}");
+            }
+        }
+
         Ok(Self {
             handle: tokio::sync::Mutex::new(handle),
             blocked: Mutex::new(blocked),
             iface: config.primary_iface(),
             suricata_rules: Mutex::new(Vec::new()),
             next_suri_rule_id: AtomicU64::new(1),
+            qos_classes: Mutex::new(qos_classes),
+            next_qos_class_id: AtomicU64::new(next_qos_class_id),
             suricata_prefilter: AtomicBool::new(config.suricata.prefilter),
             persist,
             api_keys: config.daemon.api_keys.clone(),
@@ -441,6 +478,283 @@ impl AppState {
         }
         Ok(removed)
     }
+
+    // ---- QoS 分类（WebAPI 管理，热同步 QOS_CLASSES）----
+
+    /// 当前全部 QoS 分类（API 输出）。
+    pub fn qos_classes_out(&self) -> Vec<QosClassOut> {
+        self.qos_classes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| qos_class_to_out(r))
+            .collect()
+    }
+
+    /// 重同步 QoS 分类到 eBPF（增删改/恢复后调用）。
+    pub async fn resync_qos(&self) -> Result<()> {
+        let entries: Vec<k_firewall_common::maps::QosConfig> = self
+            .qos_classes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| qos_config_from_row(r, &self.interfaces))
+            .collect();
+        let mut handle = self.handle.lock().await;
+        handle.sync_qos_classes(&entries)
+    }
+
+    /// 新增一个 QoS 分类：校验 → 持久化 → 内存 → 热同步。
+    pub async fn add_qos_class(&self, req: &QosClassRequest) -> Result<QosClassOut> {
+        validate_qos_class(
+            &req.name,
+            req.dscp,
+            &req.proto,
+            req.src_port,
+            req.dst_port,
+            &self.interfaces,
+            &req.ingress_iface,
+        )?;
+        let (row, id) = {
+            let mut list = self.qos_classes.lock().unwrap();
+            if list.iter().any(|r| r.name == req.name) {
+                anyhow::bail!("qos class {:?} already exists", req.name);
+            }
+            let mut row = crate::persist::QosClassRow {
+                id: None,
+                name: req.name.clone(),
+                dscp: req.dscp,
+                ingress_iface: req.ingress_iface.clone().unwrap_or_default(),
+                proto: req.proto.clone(),
+                src_port: req.src_port,
+                dst_port: req.dst_port,
+                rate_bps: req.rate_bps,
+                burst_bytes: req.burst_bytes,
+                enabled: true,
+            };
+            let id = match &self.persist {
+                Some(p) => p.insert_qos_class(&row)?,
+                None => self.next_qos_class_id.fetch_add(1, Ordering::Relaxed) as i64,
+            };
+            row.id = Some(id);
+            list.push(row.clone());
+            (row, id)
+        };
+        self.resync_qos().await?;
+        info!("qos class added via API: id={id} name={}", req.name);
+        Ok(qos_class_to_out(&row))
+    }
+
+    /// 原地替换一个 QoS 分类（PUT）。None = 不存在。
+    pub async fn update_qos_class(
+        &self,
+        id: u64,
+        req: &QosClassUpdateRequest,
+    ) -> Result<Option<QosClassOut>> {
+        validate_qos_class(
+            &req.name,
+            req.dscp,
+            &req.proto,
+            req.src_port,
+            req.dst_port,
+            &self.interfaces,
+            &req.ingress_iface,
+        )?;
+        let row = {
+            let mut list = self.qos_classes.lock().unwrap();
+            let idx = match list.iter().position(|r| r.id == Some(id as i64)) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            if list
+                .iter()
+                .enumerate()
+                .any(|(i, r)| i != idx && r.name == req.name)
+            {
+                anyhow::bail!("qos class {:?} already exists", req.name);
+            }
+            let row = crate::persist::QosClassRow {
+                id: Some(id as i64),
+                name: req.name.clone(),
+                dscp: req.dscp,
+                ingress_iface: req.ingress_iface.clone().unwrap_or_default(),
+                proto: req.proto.clone(),
+                src_port: req.src_port,
+                dst_port: req.dst_port,
+                rate_bps: req.rate_bps,
+                burst_bytes: req.burst_bytes,
+                enabled: list[idx].enabled,
+            };
+            if let Some(p) = &self.persist {
+                p.update_qos_class(id as i64, &row)?;
+            }
+            list[idx] = row.clone();
+            row
+        };
+        self.resync_qos().await?;
+        info!("qos class updated via API: id={id}");
+        Ok(Some(qos_class_to_out(&row)))
+    }
+
+    /// 部分更新一个 QoS 分类（PATCH，启停）。None = 不存在。
+    pub async fn patch_qos_class(
+        &self,
+        id: u64,
+        enabled: Option<bool>,
+    ) -> Result<Option<QosClassOut>> {
+        let exists = {
+            let list = self.qos_classes.lock().unwrap();
+            list.iter().any(|r| r.id == Some(id as i64))
+        };
+        if !exists {
+            return Ok(None);
+        }
+        if let Some(v) = enabled {
+            if let Some(p) = &self.persist {
+                p.patch_qos_class(id as i64, v)?;
+            }
+            let mut list = self.qos_classes.lock().unwrap();
+            if let Some(r) = list.iter_mut().find(|r| r.id == Some(id as i64)) {
+                r.enabled = v;
+            }
+        }
+        self.resync_qos().await?;
+        Ok(self
+            .qos_classes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == Some(id as i64))
+            .map(qos_class_to_out))
+    }
+
+    /// 删除一个 QoS 分类（按 id）。
+    pub async fn delete_qos_class(&self, id: u64) -> Result<bool> {
+        let removed = {
+            let mut list = self.qos_classes.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| r.id != Some(id as i64));
+            list.len() != before
+        };
+        if !removed {
+            return Ok(false);
+        }
+        if let Some(p) = &self.persist {
+            p.delete_qos_class(id as i64)?;
+        }
+        self.resync_qos().await?;
+        info!("qos class deleted via API: id={id}");
+        Ok(true)
+    }
+
+    /// 批量删除 QoS 分类，返回删除条数。
+    pub async fn delete_qos_classes(&self, ids: &[u64]) -> Result<usize> {
+        let removed = {
+            let mut list = self.qos_classes.lock().unwrap();
+            let before = list.len();
+            list.retain(|r| !ids.contains(&(r.id.unwrap_or(0) as u64)));
+            before - list.len()
+        };
+        if removed > 0 {
+            let ids_i64: Vec<i64> = ids.iter().map(|i| *i as i64).collect();
+            if let Some(p) = &self.persist {
+                for id in ids_i64 {
+                    p.delete_qos_class(id)?;
+                }
+            }
+            self.resync_qos().await?;
+        }
+        Ok(removed)
+    }
+}
+
+// ---- QoS 辅助函数 ----
+
+/// 由运行时 QoS 行 + 接口列表推导 eBPF `QosConfig`（与配置加载路径一致：
+/// 入向接口解析为物理 ifindex，端口转网络序，rate 上限 u32）。
+fn qos_config_from_row(
+    row: &crate::persist::QosClassRow,
+    interfaces: &[crate::config::InterfaceConfig],
+) -> k_firewall_common::maps::QosConfig {
+    let ingress_ifindex = if row.ingress_iface.is_empty() {
+        0
+    } else {
+        interfaces
+            .iter()
+            .find(|i| i.name == row.ingress_iface)
+            .and_then(|i| {
+                std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", i.phy_name())).ok()
+            })
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let proto = match row.proto.as_str() {
+        "tcp" => 6,
+        "udp" => 17,
+        "icmp" => 1,
+        "icmp6" | "icmpv6" => 58,
+        _ => 0,
+    };
+    k_firewall_common::maps::QosConfig {
+        ingress_ifindex,
+        proto,
+        _pad: [0; 3],
+        src_port: row.src_port.to_be(),
+        dst_port: row.dst_port.to_be(),
+        dscp: row.dscp,
+        _pad2: [0; 3],
+        rate_bps: row.rate_bps.min(u32::MAX as u64) as u32,
+        burst_bytes: row.burst_bytes,
+    }
+}
+
+/// 运行时 QoS 行 → API 输出。
+fn qos_class_to_out(row: &crate::persist::QosClassRow) -> QosClassOut {
+    QosClassOut {
+        id: row.id.unwrap_or(0) as u64,
+        name: row.name.clone(),
+        dscp: row.dscp,
+        ingress_iface: if row.ingress_iface.is_empty() {
+            None
+        } else {
+            Some(row.ingress_iface.clone())
+        },
+        proto: row.proto.clone(),
+        src_port: row.src_port,
+        dst_port: row.dst_port,
+        rate_bps: row.rate_bps,
+        burst_bytes: row.burst_bytes,
+        enabled: row.enabled,
+    }
+}
+
+/// 校验 QoS 分类字段（与配置加载路径一致）。
+fn validate_qos_class(
+    name: &str,
+    dscp: u8,
+    proto: &str,
+    _src_port: u16,
+    _dst_port: u16,
+    interfaces: &[crate::config::InterfaceConfig],
+    ingress_iface: &Option<String>,
+) -> Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("name is required");
+    }
+    if dscp > 63 {
+        anyhow::bail!("dscp out of range 0..63");
+    }
+    match proto {
+        "tcp" | "udp" | "icmp" | "icmp6" | "icmpv6" | "any" | "" => {}
+        other => anyhow::bail!("unsupported proto {other:?} (tcp|udp|icmp|icmp6|any)"),
+    }
+    if let Some(iface) = ingress_iface {
+        if !iface.is_empty() && !interfaces.iter().any(|i| i.name == *iface) {
+            anyhow::bail!("unknown ingress_iface {iface:?}");
+        }
+    }
+    Ok(())
 }
 
 /// 持久化数据库路径（日志用）。
@@ -532,7 +846,7 @@ async fn sse_events(
 ) -> axum::response::Sse<
     impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
-    let mut rx = s.event_tx.subscribe();
+    let rx = s.event_tx.subscribe();
     let _ = s.event_tx.send(json!({"event": "connected", "data": {}}));
     let stream = futures_util::StreamExt::filter_map(
         tokio_stream::wrappers::BroadcastStream::new(rx),
@@ -1099,7 +1413,7 @@ async fn post_system_config(
 
 /// POST /api/v1/system/config/validate：只校验，不落盘。
 async fn post_system_config_validate(
-    State(s): State<Arc<AppState>>,
+    State(_s): State<Arc<AppState>>,
     body: axum::body::Bytes,
 ) -> Json<ConfigValidateOut> {
     let text = String::from_utf8_lossy(&body).to_string();
@@ -1350,6 +1664,95 @@ async fn export_suri_rules(State(s): State<Arc<AppState>>) -> axum::response::Re
         .expect("static response")
 }
 
+// /api/v1/qos/classes：QoS 分类 CRUD（热同步 QOS_CLASSES）
+// ============================================================================
+
+/// GET /api/v1/qos/classes：列出全部 QoS 分类。
+async fn list_qos_classes(State(s): State<Arc<AppState>>) -> Json<QosClassListOut> {
+    let entries = s.qos_classes_out();
+    let total = entries.len();
+    Json(QosClassListOut { total, entries })
+}
+
+/// POST /api/v1/qos/classes：新增一个 QoS 分类。
+async fn add_qos_class(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<QosClassRequest>,
+) -> Result<Json<QosClassOut>, ApiError> {
+    let out = s
+        .add_qos_class(&req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(out))
+}
+
+/// PUT /api/v1/qos/classes/{id}：原地替换。
+async fn update_qos_class(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<QosClassUpdateRequest>,
+) -> Result<Json<QosClassOut>, ApiError> {
+    let out = s
+        .update_qos_class(id, &req)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("qos class {id} not found")))
+        .map(Json)
+}
+
+/// PATCH /api/v1/qos/classes/{id}：启停。
+async fn patch_qos_class(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+    Json(req): Json<QosClassPatchRequest>,
+) -> Result<Json<QosClassOut>, ApiError> {
+    if req.enabled.is_none() {
+        return Err(ApiError::bad_request("enabled is required"));
+    }
+    let out = s
+        .patch_qos_class(id, req.enabled)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    out.ok_or_else(|| ApiError::bad_request(format!("qos class {id} not found")))
+        .map(Json)
+}
+
+/// DELETE /api/v1/qos/classes/{id}：删除单个。
+async fn delete_qos_class(
+    State(s): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = s
+        .delete_qos_class(id)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !removed {
+        return Err(ApiError::bad_request(format!("qos class {id} not found")));
+    }
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "classes": s.qos_classes_out(),
+    })))
+}
+
+/// DELETE /api/v1/qos/classes：按 ids 批量删除。
+async fn delete_qos_classes(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<QosClassDeleteRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if req.ids.is_empty() {
+        return Err(ApiError::bad_request("ids is required"));
+    }
+    let removed = s
+        .delete_qos_classes(&req.ids)
+        .await
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "removed": removed,
+        "classes": s.qos_classes_out(),
+    })))
+}
+
 fn router(state: Arc<AppState>) -> Router {
     // /api/v1：所有端点都必须携带 API Key（`Authorization: Bearer <key>` 或 `X-API-Key: <key>`）。
     let api_v1 = Router::new()
@@ -1390,6 +1793,14 @@ fn router(state: Arc<AppState>) -> Router {
                 .put(update_suri_rule),
         )
         .route("/suricata/rules", delete(delete_suri_rules))
+        .route("/qos/classes", get(list_qos_classes).post(add_qos_class))
+        .route(
+            "/qos/classes/{id}",
+            put(update_qos_class)
+                .patch(patch_qos_class)
+                .delete(delete_qos_class),
+        )
+        .route("/qos/classes", delete(delete_qos_classes))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_key,

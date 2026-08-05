@@ -276,6 +276,62 @@ pub fn openapi_doc() -> Value {
                     }
                 }
             },
+            "/api/v1/qos/classes": {
+                "get": {
+                    "summary": "列出全部 QoS 分类（DSCP 打标 + 每类入口限速）",
+                    "operationId": "listQosClasses",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassListOut" } } } } }
+                },
+                "post": {
+                    "summary": "新增一个 QoS 分类（持久化 + 热同步 QOS_CLASSES）",
+                    "operationId": "addQosClass",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassRequest" } } } },
+                    "responses": {
+                        "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassOut" } } } },
+                        "400": { "description": "校验失败（如重复 name / dscp>63 / 未知接口）", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+                    }
+                },
+                "delete": {
+                    "summary": "批量删除 QoS 分类（body 传 ids 数组）",
+                    "operationId": "deleteQosClasses",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassDeleteRequest" } } } },
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "integer" }, "classes": { "type": "array", "items": { "$ref": "#/components/schemas/QosClassOut" } } } } } } } }
+                }
+            },
+            "/api/v1/qos/classes/{id}": {
+                "delete": {
+                    "summary": "按 id 删除一个 QoS 分类（同步更新 eBPF QOS_CLASSES）",
+                    "operationId": "deleteQosClass",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "responses": { "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object", "properties": { "removed": { "type": "integer" }, "classes": { "type": "array", "items": { "$ref": "#/components/schemas/QosClassOut" } } } } } } } }
+                },
+                "patch": {
+                    "summary": "部分更新一个 QoS 分类（启停；body 可只带 enabled）",
+                    "operationId": "patchQosClass",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassPatchRequest" } } } },
+                    "responses": {
+                        "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassOut" } } } },
+                        "400": { "description": "分类不存在" }
+                    }
+                },
+                "put": {
+                    "summary": "原地替换一个 QoS 分类（重新校验并热同步）",
+                    "operationId": "updateQosClass",
+                    "security": [{ "ApiKeyAuth": [] }],
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer", "format": "int64" } }],
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassUpdateRequest" } } } },
+                    "responses": {
+                        "200": { "description": "OK", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/QosClassOut" } } } },
+                        "400": { "description": "校验失败或分类不存在" }
+                    }
+                }
+            },
             "/status": {
                 "get": {
                     "summary": "运行状态",
@@ -563,6 +619,64 @@ pub fn openapi_doc() -> Value {
                         "changed_keys": { "type": "array", "items": { "type": "string" } },
                         "summary": { "type": "array", "items": { "type": "string" } }
                     }
+                },
+                "QosClassOut": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "integer", "format": "int64" },
+                        "name": { "type": "string", "description": "分类名（唯一）" },
+                        "dscp": { "type": "integer", "format": "int32", "minimum": 0, "maximum": 63 },
+                        "ingress_iface": { "type": "string", "nullable": true, "description": "入向接口逻辑名；null = 任意" },
+                        "proto": { "type": "string", "enum": ["tcp", "udp", "icmp", "icmp6", "any"] },
+                        "src_port": { "type": "integer", "format": "int32" },
+                        "dst_port": { "type": "integer", "format": "int32" },
+                        "rate_bps": { "type": "integer", "format": "int64", "description": "入口限速（字节/秒）；0 = 不限速" },
+                        "burst_bytes": { "type": "integer", "format": "int32", "description": "桶容量（突发字节）" },
+                        "enabled": { "type": "boolean" }
+                    }
+                },
+                "QosClassRequest": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "dscp": { "type": "integer", "format": "int32", "default": 0 },
+                        "ingress_iface": { "type": "string", "nullable": true },
+                        "proto": { "type": "string", "default": "any" },
+                        "src_port": { "type": "integer", "format": "int32", "default": 0 },
+                        "dst_port": { "type": "integer", "format": "int32", "default": 0 },
+                        "rate_bps": { "type": "integer", "format": "int64", "default": 0 },
+                        "burst_bytes": { "type": "integer", "format": "int32", "default": 16000 }
+                    }
+                },
+                "QosClassUpdateRequest": {
+                    "type": "object",
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "dscp": { "type": "integer", "format": "int32", "default": 0 },
+                        "ingress_iface": { "type": "string", "nullable": true },
+                        "proto": { "type": "string", "default": "any" },
+                        "src_port": { "type": "integer", "format": "int32", "default": 0 },
+                        "dst_port": { "type": "integer", "format": "int32", "default": 0 },
+                        "rate_bps": { "type": "integer", "format": "int64", "default": 0 },
+                        "burst_bytes": { "type": "integer", "format": "int32", "default": 16000 }
+                    }
+                },
+                "QosClassPatchRequest": {
+                    "type": "object",
+                    "properties": { "enabled": { "type": "boolean" } }
+                },
+                "QosClassListOut": {
+                    "type": "object",
+                    "properties": {
+                        "total": { "type": "integer", "format": "int64" },
+                        "entries": { "type": "array", "items": { "$ref": "#/components/schemas/QosClassOut" } }
+                    }
+                },
+                "QosClassDeleteRequest": {
+                    "type": "object",
+                    "properties": { "ids": { "type": "array", "items": { "type": "integer", "format": "int64" } } }
                 },
                 "Envelope": {
                     "type": "object",

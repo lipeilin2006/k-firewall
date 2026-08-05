@@ -125,7 +125,6 @@ alg:
 # QoS：默认全量转发，可按需分类限速。
 qos:
   classes: []
-  shaping: []
 
 # 源 IP 速率限制：额外一层 DDoS 缓解（可选）。
 rate_limit_rules: []

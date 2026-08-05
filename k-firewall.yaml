@@ -171,21 +171,6 @@ qos:
       dst_port: 0
       rate_bps: 0         # 仅打标不限速
       burst_bytes: 16384
-  # 出口整形（HTB；interface 为逻辑名，default_classid 需已在 classes 中定义）
-  shaping:
-    - interface: lan0
-      default_classid: "1:10"
-      classes:
-        - classid: "1:10"
-          dscp: 0
-          rate_bps: 8000000
-          ceil_bps: 10000000
-          burst_bytes: 32768
-        - classid: "1:20"
-          dscp: 46
-          rate_bps: 512000
-          ceil_bps: 1024000
-          burst_bytes: 16384
 
 # 静态规则：精确五元组（通配 / CIDR 匹配将在后续里程碑引入）。
 # tcp/udp 规则必须给出 src_port 与 dst_port。

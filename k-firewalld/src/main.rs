@@ -21,7 +21,6 @@ mod nat;
 mod netlink;
 mod openapi;
 mod persist;
-mod qos;
 mod stats;
 mod suricata;
 mod suricata_rules;
@@ -70,7 +69,7 @@ async fn main() -> Result<()> {
     // 接口需要先脱离独立链路状态）。
     bridge::setup_transparent_bridges(&config)?;
 
-    let mut handle = ebpf_loader::EbpfHandle::load_and_attach(&config)?;
+    let handle = ebpf_loader::EbpfHandle::load_and_attach(&config)?;
     info!(
         "XDP attached to {} (default action {})",
         handle.ifaces().join(", "),
@@ -93,13 +92,6 @@ async fn main() -> Result<()> {
 
     // IPv6 NAT66（masquerade 出口）：独立 kfw_nat6 表，与 IPv4 隔离。
     nat::sync_nat6_rules(&config)?;
-
-    // QoS 出口整形（HTB）：按 `qos.shaping` 配置下发 tc 规则。
-    if !config.qos.shaping.is_empty() {
-        if let Err(e) = qos::setup_shaping(&config) {
-            warn!("QoS shaping setup failed: {e:#}");
-        }
-    }
 
     // DHCPv6 服务：对配置了 `dhcp6_server` 的 LAN 接口提供有状态地址分配。
     for h in dhcp::spawn_servers(&config) {

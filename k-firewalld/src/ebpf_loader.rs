@@ -176,6 +176,10 @@ pub struct EbpfHandle {
     /// 各 `CT_STATE_*` 状态超时（秒），加载时从配置写入；供 `dump_sessions`
     /// 计算 `expire_in_secs` 等只读字段（与 `prune_conntrack` 的 cfg 保持同一来源）。
     ct_timeouts: [u32; CT_STATE_MAX],
+    /// QoS 分类配置数组（`QOS_CLASSES`，长度固定 `QOS_MAX`）：运行时全量重同步复用。
+    qos_classes: Array<MapData, QosConfig>,
+    /// QoS 每类入口限速桶（`QOS_BUCKETS`，per-CPU）。
+    qos_buckets: PerCpuArray<MapData, QosBucket>,
 }
 
 /// 会话的应用层元数据（来自 Suricata eve 事件）。
@@ -575,7 +579,7 @@ impl EbpfHandle {
             config.conntrack.enabled, timeouts
         );
 
-        // QoS：分类配置 + 入口限速桶。
+        // QoS：分类配置 + 入口限速桶（句柄常驻，运行时热同步复用）。
         let mut qos_classes: Array<_, QosConfig> = Array::try_from(
             ebpf.take_map("QOS_CLASSES")
                 .context("QOS_CLASSES map not found")?,
@@ -594,7 +598,7 @@ impl EbpfHandle {
                 entry.burst_bytes
             );
         }
-        let _qos_buckets: PerCpuArray<_, QosBucket> = PerCpuArray::try_from(
+        let qos_buckets: PerCpuArray<_, QosBucket> = PerCpuArray::try_from(
             ebpf.take_map("QOS_BUCKETS")
                 .context("QOS_BUCKETS map not found")?,
         )?;
@@ -760,6 +764,10 @@ impl EbpfHandle {
         )?;
         // 初始关闭规则头预过滤已在 config_map 阶段写入。
 
+        // QoS 分类/限速桶常驻句柄：运行时热同步（WebAPI 增删改）复用。
+        // 复用 load 阶段 take 的 QoS 常驻句柄（QOS_CLASSES / QOS_BUCKETS），
+        // 供运行时 `sync_qos_classes` 热同步。
+
         Ok(Self {
             ebpf,
             ifaces,
@@ -769,6 +777,8 @@ impl EbpfHandle {
             suricata_rules_src_any,
             session_meta,
             ct_timeouts: timeouts,
+            qos_classes,
+            qos_buckets,
         })
     }
 
@@ -815,6 +825,44 @@ impl EbpfHandle {
             tuples.src.len(),
             tuples.src_any.len(),
             enabled
+        );
+        Ok(())
+    }
+
+    /// 全量同步 QoS 分类：清空 `QOS_CLASSES` 后写入全部条目，并更新
+    /// `CONFIG_QOS_COUNT`（控制 eBPF 遍历数量）。`QOS_BUCKETS` 桶按索引
+    /// 复用，由 eBPF 侧 `apply_qos` 以 count 为界访问，无需显式清零。
+    pub fn sync_qos_classes(&mut self, entries: &[QosConfig]) -> Result<()> {
+        let count = entries.len().min(k_firewall_common::maps::QOS_MAX as usize);
+        // 先清空整张表（写入零值），避免残留旧条目被 eBPF 遍历。
+        let zero = QosConfig {
+            ingress_ifindex: 0,
+            proto: 0,
+            _pad: [0; 3],
+            src_port: 0,
+            dst_port: 0,
+            dscp: 0,
+            _pad2: [0; 3],
+            rate_bps: 0,
+            burst_bytes: 0,
+        };
+        for i in 0..k_firewall_common::maps::QOS_MAX {
+            self.qos_classes.set(i, zero, 0)?;
+        }
+        for (i, entry) in entries.iter().enumerate().take(count) {
+            self.qos_classes.set(i as u32, *entry, 0)?;
+        }
+        let mut config_map: Array<_, u32> = Array::try_from(
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
+        )?;
+        config_map.set(CONFIG_QOS_COUNT, count as u32, 0)?;
+        info!(
+            "QOS synced: {} classes (max {}), CONFIG_QOS_COUNT={}",
+            count,
+            k_firewall_common::maps::QOS_MAX,
+            count
         );
         Ok(())
     }
@@ -1147,7 +1195,7 @@ impl EbpfHandle {
     pub fn read_prefilter_stats(
         &mut self,
     ) -> Result<k_firewall_common::api::SuricataPrefilterStats> {
-        let mut config_map: Array<_, u32> = Array::try_from(
+        let config_map: Array<_, u32> = Array::try_from(
             self.ebpf
                 .map_mut("CONFIG")
                 .context("CONFIG map not found")?,
@@ -1215,7 +1263,7 @@ impl EbpfHandle {
     pub fn reconcile_conn_counts(&mut self) -> Result<()> {
         // 阶段 1：读 CONNTRACK 内容到用户态（borrow 随闭包结束释放）。
         let snap: Vec<(FiveTuple, CtValue)> = {
-            let mut ct_map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
+            let ct_map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
                 self.ebpf
                     .map_mut("CONNTRACK")
                     .context("CONNTRACK map not found")?,
@@ -1400,7 +1448,7 @@ async fn tail_eve_file(
             let len = metadata.len();
             if len > last_pos {
                 if let Ok(file) = std::fs::File::open(file_path) {
-                    use std::io::{BufRead, Read, Seek};
+                    use std::io::{BufRead, Seek};
                     let mut reader = std::io::BufReader::new(file);
                     reader.seek(std::io::SeekFrom::Start(last_pos)).ok();
                     let mut line = String::new();

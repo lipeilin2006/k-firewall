@@ -470,4 +470,91 @@ pub mod api {
         #[serde(default)]
         pub sort: Option<String>,
     }
+
+    // ==========================================================================
+    // QoS 分类（WebAPI 管理，热同步到 QOS_CLASSES）——`/api/v1/qos/classes`
+    // ==========================================================================
+
+    /// 单个 QoS 分类（输出；`id` 供 PUT/PATCH/DELETE 使用）。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QosClassOut {
+        pub id: u64,
+        /// 分类名（唯一，供展示）。
+        pub name: String,
+        /// 目标 DSCP（0-63）。
+        pub dscp: u8,
+        /// 入向接口逻辑名；空/None = 任意接口。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ingress_iface: Option<String>,
+        /// 协议名（tcp|udp|icmp|icmp6|any）。
+        pub proto: String,
+        /// 源端口（0 = 任意）。
+        pub src_port: u16,
+        /// 目的端口（0 = 任意）。
+        pub dst_port: u16,
+        /// 每类入口限速（字节/秒）；0 = 不限速。
+        pub rate_bps: u64,
+        /// 桶容量（突发字节）。
+        pub burst_bytes: u32,
+        /// 是否启用。
+        pub enabled: bool,
+    }
+
+    /// POST /api/v1/qos/classes：新增一个 QoS 分类。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QosClassRequest {
+        pub name: String,
+        pub dscp: u8,
+        #[serde(default)]
+        pub ingress_iface: Option<String>,
+        #[serde(default)]
+        pub proto: String,
+        #[serde(default)]
+        pub src_port: u16,
+        #[serde(default)]
+        pub dst_port: u16,
+        #[serde(default)]
+        pub rate_bps: u64,
+        #[serde(default)]
+        pub burst_bytes: u32,
+    }
+
+    /// PUT /api/v1/qos/classes/{id}：原地替换一个分类。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QosClassUpdateRequest {
+        pub name: String,
+        pub dscp: u8,
+        #[serde(default)]
+        pub ingress_iface: Option<String>,
+        #[serde(default)]
+        pub proto: String,
+        #[serde(default)]
+        pub src_port: u16,
+        #[serde(default)]
+        pub dst_port: u16,
+        #[serde(default)]
+        pub rate_bps: u64,
+        #[serde(default)]
+        pub burst_bytes: u32,
+    }
+
+    /// PATCH /api/v1/qos/classes/{id}：部分更新（启用/禁用）。
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct QosClassPatchRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub enabled: Option<bool>,
+    }
+
+    /// GET /api/v1/qos/classes 结果。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QosClassListOut {
+        pub total: usize,
+        pub entries: Vec<QosClassOut>,
+    }
+
+    /// DELETE /api/v1/qos/classes：按 id 批量删除。
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct QosClassDeleteRequest {
+        pub ids: Vec<u64>,
+    }
 }
