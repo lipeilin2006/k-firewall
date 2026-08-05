@@ -149,11 +149,7 @@ fn parse_line(line: &str, cfg: &Suricata, tx: &UnboundedSender<Alert>) {
     if severity > cfg.block_severity_max {
         return;
     }
-    let Some(ip) = rec
-        .src_ip
-        .as_deref()
-        .and_then(|s| s.parse::<IpAddr>().ok())
-    else {
+    let Some(ip) = rec.src_ip.as_deref().and_then(|s| s.parse::<IpAddr>().ok()) else {
         return;
     };
     let _ = tx.send(Alert {

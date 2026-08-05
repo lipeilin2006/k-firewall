@@ -132,7 +132,10 @@ pub fn sync_nat_rules(config: &Config) -> Result<()> {
         count += 1;
     }
     if count > 0 {
-        info!("NAT: synced {} masquerade rule(s) in table {NAT_TABLE}", count);
+        info!(
+            "NAT: synced {} masquerade rule(s) in table {NAT_TABLE}",
+            count
+        );
     }
     Ok(())
 }

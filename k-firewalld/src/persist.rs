@@ -48,7 +48,9 @@ impl Persist {
                     .with_context(|| format!("create db dir {}", parent.display()))?;
             }
         }
-        let p = Self { path: path.to_path_buf() };
+        let p = Self {
+            path: path.to_path_buf(),
+        };
         p.with_conn(|c| {
             c.execute_batch(
                 "PRAGMA journal_mode=WAL;
@@ -167,7 +169,10 @@ impl Persist {
     pub fn delete_suricata_rule(&self, id: i64) -> Result<bool> {
         self.with_conn(|c| {
             let n = c
-                .execute("DELETE FROM suricata_rules WHERE id = ?1", rusqlite::params![id])
+                .execute(
+                    "DELETE FROM suricata_rules WHERE id = ?1",
+                    rusqlite::params![id],
+                )
                 .context("delete suricata rule")?;
             Ok(n > 0)
         })
@@ -182,7 +187,10 @@ impl Persist {
             let mut removed = 0;
             for id in ids {
                 let n = c
-                    .execute("DELETE FROM suricata_rules WHERE id = ?1", rusqlite::params![id])
+                    .execute(
+                        "DELETE FROM suricata_rules WHERE id = ?1",
+                        rusqlite::params![id],
+                    )
                     .context("delete suricata rule")?;
                 removed += n;
             }
@@ -193,7 +201,8 @@ impl Persist {
     /// 清空全部 Suricata 规则。
     pub fn clear_suricata_rules(&self) -> Result<()> {
         self.with_conn(|c| {
-            c.execute("DELETE FROM suricata_rules", []).context("clear suricata rules")?;
+            c.execute("DELETE FROM suricata_rules", [])
+                .context("clear suricata rules")?;
             Ok(())
         })
     }
@@ -262,8 +271,11 @@ impl Persist {
     /// 删除一条封禁记录。
     pub fn delete_blocklist(&self, ip: &IpAddr) -> Result<()> {
         self.with_conn(|c| {
-            c.execute("DELETE FROM blocklist WHERE ip = ?1", params![ip.to_string()])
-                .context("delete blocklist")?;
+            c.execute(
+                "DELETE FROM blocklist WHERE ip = ?1",
+                params![ip.to_string()],
+            )
+            .context("delete blocklist")?;
             Ok(())
         })
     }

@@ -77,7 +77,11 @@ async fn main() -> Result<()> {
         config.default_action
     );
 
-    let state = Arc::new(AppState::new(handle, config.clone(), Some(opt.config.clone()))?);
+    let state = Arc::new(AppState::new(
+        handle,
+        config.clone(),
+        Some(opt.config.clone()),
+    )?);
 
     // 恢复持久化的 Suricata 规则并重同步 eBPF 预过滤表。
     if let Err(e) = suricata_rules::restore(&state).await {

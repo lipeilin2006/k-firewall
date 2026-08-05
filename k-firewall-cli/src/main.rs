@@ -49,7 +49,11 @@ async fn main() -> Result<ExitCode> {
             seconds,
             reason,
         } => {
-            let body = serde_json::to_vec(&BlockRequest { ip, seconds, reason })?;
+            let body = serde_json::to_vec(&BlockRequest {
+                ip,
+                seconds,
+                reason,
+            })?;
             ("POST", "/block", Some(body))
         }
         Cmd::Unblock { ip } => {

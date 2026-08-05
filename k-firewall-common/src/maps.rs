@@ -117,11 +117,19 @@ impl IpKey {
     pub fn from_ipv4(a: u32) -> Self {
         let mut ip = [0u8; 16];
         ip[0..4].copy_from_slice(&a.to_be_bytes());
-        Self { family: FAMILY_IPV4, _pad: [0; 3], ip }
+        Self {
+            family: FAMILY_IPV4,
+            _pad: [0; 3],
+            ip,
+        }
     }
 
     pub fn from_ipv6(a: [u8; 16]) -> Self {
-        Self { family: FAMILY_IPV6, _pad: [0; 3], ip: a }
+        Self {
+            family: FAMILY_IPV6,
+            _pad: [0; 3],
+            ip: a,
+        }
     }
 }
 
@@ -150,11 +158,23 @@ impl FragKey {
         s[0..4].copy_from_slice(&src.to_be_bytes());
         let mut d = [0u8; 16];
         d[0..4].copy_from_slice(&dst.to_be_bytes());
-        Self { family: FAMILY_IPV4, proto, _pad: [0; 2], src_ip: s, dst_ip: d }
+        Self {
+            family: FAMILY_IPV4,
+            proto,
+            _pad: [0; 2],
+            src_ip: s,
+            dst_ip: d,
+        }
     }
 
     pub fn from_ipv6(src: [u8; 16], dst: [u8; 16], proto: u8) -> Self {
-        Self { family: FAMILY_IPV6, proto, _pad: [0; 2], src_ip: src, dst_ip: dst }
+        Self {
+            family: FAMILY_IPV6,
+            proto,
+            _pad: [0; 2],
+            src_ip: src,
+            dst_ip: dst,
+        }
     }
 }
 
@@ -204,7 +224,13 @@ impl FiveTuple {
         }
     }
 
-    pub fn from_ipv6(src: [u8; 16], dst: [u8; 16], proto: u8, src_port: u16, dst_port: u16) -> Self {
+    pub fn from_ipv6(
+        src: [u8; 16],
+        dst: [u8; 16],
+        proto: u8,
+        src_port: u16,
+        dst_port: u16,
+    ) -> Self {
         Self {
             family: FAMILY_IPV6,
             proto,
@@ -320,7 +346,12 @@ impl DnatKey {
     pub fn from_ipv4(dst_ip: u32, dst_port: u16, proto: u8) -> Self {
         let mut d = [0u8; 16];
         d[0..4].copy_from_slice(&dst_ip.to_be_bytes());
-        Self { dst_ip: d, dst_port, proto, _pad: 0 }
+        Self {
+            dst_ip: d,
+            dst_port,
+            proto,
+            _pad: 0,
+        }
     }
 }
 
@@ -340,7 +371,11 @@ impl DnatValue {
     pub fn from_ipv4(to_ip: u32, to_port: u16) -> Self {
         let mut t = [0u8; 16];
         t[0..4].copy_from_slice(&to_ip.to_be_bytes());
-        Self { to_ip: t, to_port, _pad: [0; 2] }
+        Self {
+            to_ip: t,
+            to_port,
+            _pad: [0; 2],
+        }
     }
 }
 
@@ -446,7 +481,12 @@ pub struct RateState {
 
 impl RateState {
     pub fn new(rate: u32, burst: u32) -> Self {
-        Self { last: 0, tokens: burst, rate, burst }
+        Self {
+            last: 0,
+            tokens: burst,
+            rate,
+            burst,
+        }
     }
 }
 
@@ -535,7 +575,6 @@ pub struct AlgExpect {
     /// 过期时刻（CLOCK_MONOTONIC，ns）；0 = 永不过期。
     pub expire_ns: u64,
 }
-
 
 // ============================================================================
 // aya::Pod（用户态 feature）

@@ -39,9 +39,7 @@ pub async fn run(cfg: Config) {
     );
 
     let mut state = MultiwanState::default();
-    let mut ticker = tokio::time::interval(Duration::from_secs(
-        mw.check_interval_secs.max(1),
-    ));
+    let mut ticker = tokio::time::interval(Duration::from_secs(mw.check_interval_secs.max(1)));
 
     // 初始化：默认路由按当前内核配置（首次不主动改）。
     // 首次 tick 计算每个组的健康状态并应用。
@@ -143,7 +141,10 @@ fn probe_from_interface(host: &str, port: u16, iface: &str) -> bool {
 
 /// 读取接口 IPv4 地址（ip -4 addr show 解析）。
 fn iface_ip(iface: &str) -> Option<std::net::IpAddr> {
-    let out = Command::new("ip").args(["-4", "addr", "show", "dev", iface]).output().ok()?;
+    let out = Command::new("ip")
+        .args(["-4", "addr", "show", "dev", iface])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
         let line = line.trim();
@@ -198,7 +199,9 @@ fn apply_pbr(cfg: &Config, wan_gateways: &HashMap<String, String>) {
 
         // 确保路由表条目存在（幂等）。
         let _ = Command::new("ip")
-            .args(["route", "replace", "default", "via", gw, "dev", &wan, "table", &table])
+            .args([
+                "route", "replace", "default", "via", gw, "dev", &wan, "table", &table,
+            ])
             .status();
 
         // 添加 ip rule（仅当不存在）。

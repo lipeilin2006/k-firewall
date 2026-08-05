@@ -6,26 +6,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::http::StatusCode;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
+use k_firewall_common::BlockEntry;
 use k_firewall_common::api::{
     BlockRequest, BlockedEntryOut, BlockedOut, BlocklistEntryOut, BlocklistOut, ConfigDiffOut,
     ConfigRestoreOut, ConfigValidateOut, Error, InterfaceInfo, InterfaceStats, InterfaceStatsOut,
     InterfacesOut, SessionDeleteRequest, SessionListQuery, SessionOut, SessionsDeleteOut,
-    SessionsOut, SuricataPrefilterStats, SuricataRuleDeleteRequest, SuricataRuleImportOut,
-    SuricataRuleImportRequest, SuricataRuleListOut, SuricataRuleOut, SuricataRulePatchRequest,
-    SuricataRuleRequest, SuricataRuleUpdateRequest, Status, StatsOut,
+    SessionsOut, StatsOut, Status, SuricataPrefilterStats, SuricataRuleDeleteRequest,
+    SuricataRuleImportOut, SuricataRuleImportRequest, SuricataRuleListOut, SuricataRuleOut,
+    SuricataRulePatchRequest, SuricataRuleRequest, SuricataRuleUpdateRequest,
 };
-use k_firewall_common::BlockEntry;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::UnixListener;
 use tracing::{info, warn};
 
@@ -73,11 +73,7 @@ impl AppState {
         let _ = self.event_tx.send(json!({"event": event, "data": data}));
     }
 
-    pub fn new(
-        handle: EbpfHandle,
-        config: Config,
-        config_path: Option<PathBuf>,
-    ) -> Result<Self> {
+    pub fn new(handle: EbpfHandle, config: Config, config_path: Option<PathBuf>) -> Result<Self> {
         // 持久化：加载 DB 中的 Suricata 规则（若配置了 db_path）。
         let persist = config.daemon.db_path.as_ref().map(|p| Persist::open(p));
         let persist = match persist {
@@ -140,12 +136,7 @@ impl AppState {
         })
     }
 
-    pub async fn block(
-        &self,
-        ip: IpAddr,
-        seconds: Option<u64>,
-        reason: String,
-    ) -> Result<()> {
+    pub async fn block(&self, ip: IpAddr, seconds: Option<u64>, reason: String) -> Result<()> {
         let now_unix = now_unix();
         let expire_unix = seconds.map(|s| now_unix + s);
 
@@ -539,9 +530,7 @@ async fn metrics(State(s): State<Arc<AppState>>) -> Result<Response, ApiError> {
 async fn sse_events(
     State(s): State<Arc<AppState>>,
 ) -> axum::response::Sse<
-    impl futures_core::Stream<
-        Item = Result<axum::response::sse::Event, std::convert::Infallible>,
-    >,
+    impl futures_core::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
     let mut rx = s.event_tx.subscribe();
     let _ = s.event_tx.send(json!({"event": "connected", "data": {}}));
@@ -550,17 +539,14 @@ async fn sse_events(
         |item| async move {
             match item {
                 Ok(ev) => {
-                    let data =
-                        serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
+                    let data = serde_json::to_string(&ev).unwrap_or_else(|_| "{}".to_string());
                     let e = ev
                         .get("event")
                         .and_then(|v| v.as_str())
                         .unwrap_or("event")
                         .to_string();
                     Some(Ok::<_, std::convert::Infallible>(
-                        axum::response::sse::Event::default()
-                            .event(&e)
-                            .data(data),
+                        axum::response::sse::Event::default().event(&e).data(data),
                     ))
                 }
                 // Lagged / channel closed：跳过。
@@ -587,7 +573,10 @@ async fn get_blocked(State(s): State<Arc<AppState>>) -> Json<BlockedOut> {
     Json(BlockedOut { entries })
 }
 
-async fn block(State(s): State<Arc<AppState>>, Json(req): Json<BlockRequest>) -> Result<Json<Status>, ApiError> {
+async fn block(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<BlockRequest>,
+) -> Result<Json<Status>, ApiError> {
     let ip = req
         .ip
         .parse::<IpAddr>()
@@ -598,7 +587,10 @@ async fn block(State(s): State<Arc<AppState>>, Json(req): Json<BlockRequest>) ->
     Ok(Json(status_inner(&s)))
 }
 
-async fn unblock(State(s): State<Arc<AppState>>, Json(req): Json<BlockRequest>) -> Result<Json<Status>, ApiError> {
+async fn unblock(
+    State(s): State<Arc<AppState>>,
+    Json(req): Json<BlockRequest>,
+) -> Result<Json<Status>, ApiError> {
     let ip = req
         .ip
         .parse::<IpAddr>()
@@ -693,7 +685,7 @@ pub async fn wrap_envelope(req: Request, next: Next) -> Response {
             return envelope(
                 status,
                 json!({"code": 500, "message": "failed to read response body", "data": null}),
-            )
+            );
         }
     };
     if is_text {
@@ -709,11 +701,14 @@ pub async fn wrap_envelope(req: Request, next: Next) -> Response {
             return envelope(
                 status,
                 json!({"code": status.as_u16(), "message": "non-JSON response", "data": null}),
-            )
+            );
         }
     };
     if status.is_success() {
-        envelope(status, json!({"code": status.as_u16(), "message": "ok", "data": value}))
+        envelope(
+            status,
+            json!({"code": status.as_u16(), "message": "ok", "data": value}),
+        )
     } else {
         let msg = value
             .get("error")
@@ -739,7 +734,9 @@ fn envelope(status: StatusCode, body: Value) -> Response {
 fn cidr_match_ip(ip: &str, cidr: &str) -> Result<bool> {
     let (net_str, prefix) = match cidr.split_once('/') {
         Some((n, p)) => {
-            let p: u8 = p.parse().map_err(|_| anyhow!("bad CIDR prefix in {cidr:?}"))?;
+            let p: u8 = p
+                .parse()
+                .map_err(|_| anyhow!("bad CIDR prefix in {cidr:?}"))?;
             (n, Some(p))
         }
         None => (cidr, None),
@@ -773,7 +770,9 @@ async fn get_sessions(
 ) -> Result<Json<SessionsOut>, ApiError> {
     let entries: Vec<SessionOut> = {
         let mut handle = s.handle.lock().await;
-        handle.dump_sessions().map_err(|e| ApiError::bad_request(e.to_string()))?
+        handle
+            .dump_sessions()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?
     };
     let mut entries: Vec<SessionOut> = entries
         .into_iter()
@@ -821,22 +820,38 @@ async fn get_sessions(
                 }
             }
             if let Some(a) = &q.app_proto {
-                if !e.app_proto.as_deref().is_some_and(|v| v.eq_ignore_ascii_case(a)) {
+                if !e
+                    .app_proto
+                    .as_deref()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(a))
+                {
                     return false;
                 }
             }
             if let Some(s) = &q.tls_sni {
-                if !e.tls_sni.as_deref().is_some_and(|v| v.to_ascii_lowercase().contains(&s.to_ascii_lowercase())) {
+                if !e
+                    .tls_sni
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains(&s.to_ascii_lowercase()))
+                {
                     return false;
                 }
             }
             if let Some(h) = &q.http_host {
-                if !e.http_host.as_deref().is_some_and(|v| v.to_ascii_lowercase().contains(&h.to_ascii_lowercase())) {
+                if !e
+                    .http_host
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains(&h.to_ascii_lowercase()))
+                {
                     return false;
                 }
             }
             if let Some(d) = &q.dns_query {
-                if !e.dns_query.as_deref().is_some_and(|v| v.to_ascii_lowercase().contains(&d.to_ascii_lowercase())) {
+                if !e
+                    .dns_query
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains(&d.to_ascii_lowercase()))
+                {
                     return false;
                 }
             }
@@ -916,9 +931,7 @@ async fn delete_session(
     if removed == 0 {
         return Err(ApiError::not_found("session not found"));
     }
-    Ok(Json(SessionsDeleteOut {
-        removed,
-    }))
+    Ok(Json(SessionsDeleteOut { removed }))
 }
 
 fn blocklist_inner(s: &AppState) -> BlocklistOut {
@@ -968,7 +981,9 @@ async fn delete_blocklist_entry(
 }
 
 /// GET /api/v1/operational/stats/interfaces：每网卡 sysfs 收发统计。
-async fn get_interface_stats(State(s): State<Arc<AppState>>) -> Result<Json<InterfaceStatsOut>, ApiError> {
+async fn get_interface_stats(
+    State(s): State<Arc<AppState>>,
+) -> Result<Json<InterfaceStatsOut>, ApiError> {
     let mut entries = Vec::new();
     for name in &s.attach_ifaces {
         let read = |field: &str| -> u64 {
@@ -1054,8 +1069,9 @@ async fn get_system_config(State(s): State<Arc<AppState>>) -> Response {
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(Body::from(text))
             .expect("static response"),
-        Err(e) => ApiError::not_found(format!("failed to read {}: {e}", path.display()))
-            .into_response(),
+        Err(e) => {
+            ApiError::not_found(format!("failed to read {}: {e}", path.display())).into_response()
+        }
     }
 }
 
@@ -1172,10 +1188,9 @@ async fn post_system_reload(
         .map_err(|e| ApiError::bad_request(format!("invalid config: {e}")))?;
     // 热生效部分：Suricata 规则预过滤开关。
     {
-        let old = s.suricata_prefilter.swap(
-            cfg.suricata.prefilter,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let old = s
+            .suricata_prefilter
+            .swap(cfg.suricata.prefilter, std::sync::atomic::Ordering::Relaxed);
         if old != cfg.suricata.prefilter {
             s.resync_suri_prefilter().await?;
         }
@@ -1218,11 +1233,7 @@ async fn list_suri_rules(
     let page = q.page.unwrap_or(1).max(1);
     let limit = q.limit.unwrap_or(100).min(1000);
     let start = (page - 1) * limit;
-    let entries = filtered
-        .into_iter()
-        .skip(start)
-        .take(limit)
-        .collect();
+    let entries = filtered.into_iter().skip(start).take(limit).collect();
     Json(SuricataRuleListOut { total, entries })
 }
 
@@ -1273,7 +1284,9 @@ async fn delete_suri_rule(
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     if !removed {
-        return Err(ApiError::bad_request(format!("suricata rule {id} not found")));
+        return Err(ApiError::bad_request(format!(
+            "suricata rule {id} not found"
+        )));
     }
     Ok(Json(s.suri_rules_out()))
 }
@@ -1350,20 +1363,23 @@ fn router(state: Arc<AppState>) -> Router {
             "/operational/blocklist",
             get(get_blocklist).post(add_blocklist_entry),
         )
-        .route("/operational/blocklist/{ip}", delete(delete_blocklist_entry))
+        .route(
+            "/operational/blocklist/{ip}",
+            delete(delete_blocklist_entry),
+        )
         .route("/operational/stats", get(get_stats))
         .route("/operational/stats/interfaces", get(get_interface_stats))
         .route("/operational/events", get(sse_events))
         .route("/system/info", get(system_info))
         .route("/system/interfaces", get(get_interfaces))
-        .route("/system/config", get(get_system_config).post(post_system_config))
+        .route(
+            "/system/config",
+            get(get_system_config).post(post_system_config),
+        )
         .route("/system/config/validate", post(post_system_config_validate))
         .route("/system/config/diff", post(post_system_config_diff))
         .route("/system/reload", post(post_system_reload))
-        .route(
-            "/suricata/rules",
-            get(list_suri_rules).post(add_suri_rule),
-        )
+        .route("/suricata/rules", get(list_suri_rules).post(add_suri_rule))
         .route("/suricata/prefilter/stats", get(get_suri_prefilter_stats))
         .route("/suricata/rules/import", post(import_suri_rules))
         .route("/suricata/rules/export", get(export_suri_rules))
@@ -1374,7 +1390,10 @@ fn router(state: Arc<AppState>) -> Router {
                 .put(update_suri_rule),
         )
         .route("/suricata/rules", delete(delete_suri_rules))
-        .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ))
         // 统一响应信封最外层：包裹成功/失败响应为 {code, message, data}。
         .layer(middleware::from_fn(wrap_envelope));
 
@@ -1395,8 +1414,7 @@ fn router(state: Arc<AppState>) -> Router {
 /// 在 Unix Domain Socket 上提供 REST API。
 pub async fn serve(path: &Path, state: Arc<AppState>) -> Result<()> {
     let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)
-        .with_context(|| format!("bind {}", path.display()))?;
+    let listener = UnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
     // 让非 root 用户也能通过 CLI 连接（仅本机 Unix socket）
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
 
@@ -1435,7 +1453,10 @@ impl ApiError {
     }
 
     fn unauthorized() -> Self {
-        Self(StatusCode::UNAUTHORIZED, "missing or invalid API key".into())
+        Self(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid API key".into(),
+        )
     }
 
     fn internal(msg: impl Into<String>) -> Self {

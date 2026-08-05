@@ -2,29 +2,29 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use aya::Ebpf;
 use aya::maps::{
-    lpm_trie::LpmTrie, lpm_trie::Key as LpmKey, Array, DevMap, HashMap, Map, MapData,
-    PerCpuArray, RingBuf,
+    Array, DevMap, HashMap, Map, MapData, PerCpuArray, RingBuf, lpm_trie::Key as LpmKey,
+    lpm_trie::LpmTrie,
 };
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode};
-use aya::Ebpf;
 use k_firewall_common::maps::{
-    AlgExpect, ConnLimit, CtValue, DnatKey, DnatValue, FiveTuple, FragKey, IpKey, QosBucket,
-    QosConfig, RateState, SessionEvent, VifConfig, VifKey, CT_STATE_GENERIC, CT_STATE_ICMP,
-    CT_STATE_MAX, CT_STATE_TCP_ESTABLISHED, CT_STATE_TCP_FIN_WAIT, CT_STATE_TCP_SYN_RECV,
-    CT_STATE_TCP_SYN_SENT, CT_STATE_TCP_TIME_WAIT, CT_STATE_UDP, FAMILY_IPV4, FRAG_POLICY_DROP,
-    FRAG_POLICY_INSPECT, SESSION_BLOCKED, SESSION_DROP, SESSION_NEW,
+    AlgExpect, CT_STATE_GENERIC, CT_STATE_ICMP, CT_STATE_MAX, CT_STATE_TCP_ESTABLISHED,
+    CT_STATE_TCP_FIN_WAIT, CT_STATE_TCP_SYN_RECV, CT_STATE_TCP_SYN_SENT, CT_STATE_TCP_TIME_WAIT,
+    CT_STATE_UDP, ConnLimit, CtValue, DnatKey, DnatValue, FAMILY_IPV4, FRAG_POLICY_DROP,
+    FRAG_POLICY_INSPECT, FiveTuple, FragKey, IpKey, QosBucket, QosConfig, RateState,
+    SESSION_BLOCKED, SESSION_DROP, SESSION_NEW, SessionEvent, VifConfig, VifKey,
 };
 use k_firewall_common::{
-    Stats, BLOCKED_MARKER, CONFIG_DEFAULT_ACTION, CONFIG_FRAGMENT_POLICY, CONFIG_FRAG_TIMEOUT,
+    BLOCKED_MARKER, CONFIG_DEFAULT_ACTION, CONFIG_FRAG_TIMEOUT, CONFIG_FRAGMENT_POLICY,
     CONFIG_FTP_ALG, CONFIG_QOS_COUNT, CONFIG_RA_FILTER, CONFIG_SURICATA_PREFILTER,
-    CONFIG_SYN_BURST, CONFIG_SYN_MAX_HALFOPEN, CONFIG_SYN_RATE,
+    CONFIG_SYN_BURST, CONFIG_SYN_MAX_HALFOPEN, CONFIG_SYN_RATE, Stats,
 };
 use serde::Deserialize;
 use tokio::io::AsyncBufReadExt as _;
 use tracing::{debug, info, warn};
 
-use crate::config::{Conntrack, Config, SessionLog};
+use crate::config::{Config, Conntrack, SessionLog};
 
 /// Suricata eve.json event types we care about.
 #[derive(Debug, Deserialize)]
@@ -245,12 +245,22 @@ fn consume_session_events(
         let ev: SessionEvent =
             unsafe { std::ptr::read_unaligned(data.as_ptr() as *const SessionEvent) };
         let src: IpAddr = if ev.family == FAMILY_IPV4 {
-            IpAddr::V4(Ipv4Addr::new(ev.src_ip[0], ev.src_ip[1], ev.src_ip[2], ev.src_ip[3]))
+            IpAddr::V4(Ipv4Addr::new(
+                ev.src_ip[0],
+                ev.src_ip[1],
+                ev.src_ip[2],
+                ev.src_ip[3],
+            ))
         } else {
             IpAddr::V6(Ipv6Addr::from(ev.src_ip))
         };
         let dst: IpAddr = if ev.family == FAMILY_IPV4 {
-            IpAddr::V4(Ipv4Addr::new(ev.dst_ip[0], ev.dst_ip[1], ev.dst_ip[2], ev.dst_ip[3]))
+            IpAddr::V4(Ipv4Addr::new(
+                ev.dst_ip[0],
+                ev.dst_ip[1],
+                ev.dst_ip[2],
+                ev.dst_ip[3],
+            ))
         } else {
             IpAddr::V6(Ipv6Addr::from(ev.dst_ip))
         };
@@ -264,7 +274,11 @@ fn consume_session_events(
         let line = format!(
             "SESSION action={} family={} proto={} ifindex={} src={}:{} dst={}:{}",
             action,
-            if ev.family == FAMILY_IPV4 { "ipv4" } else { "ipv6" },
+            if ev.family == FAMILY_IPV4 {
+                "ipv4"
+            } else {
+                "ipv6"
+            },
             proto,
             ev.ifindex,
             src,
@@ -325,19 +339,26 @@ fn spawn_session_logger(map: Map, cfg: &SessionLog) {
         Err(_) => "k-firewall".into(),
     };
     tokio::spawn(async move {
-        let mut rb = match tokio::io::unix::AsyncFd::with_interest(rb, tokio::io::Interest::READABLE)
-        {
-            Ok(fd) => fd,
-            Err(_) => return,
-        };
+        let mut rb =
+            match tokio::io::unix::AsyncFd::with_interest(rb, tokio::io::Interest::READABLE) {
+                Ok(fd) => fd,
+                Err(_) => return,
+            };
         loop {
             let Ok(mut guard) = rb.readable_mut().await else {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             };
             match &to_syslog {
-                Some((sock, server)) => consume_session_events(guard.get_inner_mut(), Some(sock), server, &hostname),
-                None => consume_session_events(guard.get_inner_mut(), None, &SocketAddr::from(([0, 0, 0, 0], 0)), &hostname),
+                Some((sock, server)) => {
+                    consume_session_events(guard.get_inner_mut(), Some(sock), server, &hostname)
+                }
+                None => consume_session_events(
+                    guard.get_inner_mut(),
+                    None,
+                    &SocketAddr::from(([0, 0, 0, 0], 0)),
+                    &hostname,
+                ),
             }
             guard.clear_ready();
         }
@@ -355,7 +376,10 @@ fn if_index(name: &str) -> Option<i32> {
 
 /// CLOCK_MONOTONIC 纳秒（与 eBPF `bpf_ktime_get_ns` 同一时钟基）。
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
     (ts.tv_sec.max(0) as u64) * 1_000_000_000 + (ts.tv_nsec.max(0) as u64)
 }
@@ -493,10 +517,13 @@ impl EbpfHandle {
             }
         }
 
-        let mut config_map: Array<_, u32> = Array::try_from(
-            ebpf.map_mut("CONFIG").context("CONFIG map not found")?,
+        let mut config_map: Array<_, u32> =
+            Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG map not found")?)?;
+        config_map.set(
+            CONFIG_DEFAULT_ACTION,
+            config.default_action().as_u8() as u32,
+            0,
         )?;
-        config_map.set(CONFIG_DEFAULT_ACTION, config.default_action().as_u8() as u32, 0)?;
         // 分片策略 / RA 过滤 / QoS 分类数 / 分片流超时。
         let frag_policy = match config.fragment_policy.as_str() {
             "drop" => FRAG_POLICY_DROP,
@@ -526,13 +553,18 @@ impl EbpfHandle {
         config_map.set(CONFIG_SYN_BURST, syn.burst, 0)?;
         config_map.set(CONFIG_SYN_MAX_HALFOPEN, syn.max_half_open, 0)?;
         // FTP ALG 开关。
-        config_map.set(CONFIG_FTP_ALG, if config.alg.ftp_enabled { 1 } else { 0 }, 0)?;
+        config_map.set(
+            CONFIG_FTP_ALG,
+            if config.alg.ftp_enabled { 1 } else { 0 },
+            0,
+        )?;
         // Suricata 规则头预过滤：初始关闭（由运行时规则同步按需开启）。
         config_map.set(CONFIG_SURICATA_PREFILTER, 0, 0)?;
 
         // 连接跟踪每状态超时。
         let mut ct_timeouts: Array<_, u32> = Array::try_from(
-            ebpf.take_map("CT_TIMEOUTS").context("CT_TIMEOUTS map not found")?,
+            ebpf.take_map("CT_TIMEOUTS")
+                .context("CT_TIMEOUTS map not found")?,
         )?;
         let timeouts = config.conntrack.timeouts();
         for (i, t) in timeouts.iter().enumerate() {
@@ -545,7 +577,8 @@ impl EbpfHandle {
 
         // QoS：分类配置 + 入口限速桶。
         let mut qos_classes: Array<_, QosConfig> = Array::try_from(
-            ebpf.take_map("QOS_CLASSES").context("QOS_CLASSES map not found")?,
+            ebpf.take_map("QOS_CLASSES")
+                .context("QOS_CLASSES map not found")?,
         )?;
         for (i, entry) in config.qos_entries().iter().enumerate() {
             qos_classes.set(i as u32, *entry, 0)?;
@@ -562,23 +595,26 @@ impl EbpfHandle {
             );
         }
         let _qos_buckets: PerCpuArray<_, QosBucket> = PerCpuArray::try_from(
-            ebpf.take_map("QOS_BUCKETS").context("QOS_BUCKETS map not found")?,
+            ebpf.take_map("QOS_BUCKETS")
+                .context("QOS_BUCKETS map not found")?,
         )?;
 
         // 下发 VIF_MAP 与 REDIRECT_DEV。
-        let mut vif_map: HashMap<_, VifKey, VifConfig> = HashMap::try_from(
-            ebpf.take_map("VIF_MAP").context("VIF_MAP map not found")?,
+        let mut vif_map: HashMap<_, VifKey, VifConfig> =
+            HashMap::try_from(ebpf.take_map("VIF_MAP").context("VIF_MAP map not found")?)?;
+        let mut dev_map: DevMap<_> = DevMap::try_from(
+            ebpf.take_map("REDIRECT_DEV")
+                .context("REDIRECT_DEV map not found")?,
         )?;
-        let mut dev_map: DevMap<_> =
-            DevMap::try_from(ebpf.take_map("REDIRECT_DEV").context("REDIRECT_DEV map not found")?)?;
         // 本机接口 IP 集合（hybrid/route "目标为本机" 判断）。
         let mut local_ips: HashMap<_, IpKey, u8> = HashMap::try_from(
-            ebpf.take_map("LOCAL_IPS").context("LOCAL_IPS map not found")?,
+            ebpf.take_map("LOCAL_IPS")
+                .context("LOCAL_IPS map not found")?,
         )?;
         let vifs = config.vifs();
         for (phy, vlan_id, vcfg) in vifs.iter() {
-            let idx = if_index(phy)
-                .with_context(|| format!("cannot resolve ifindex for {}", phy))?;
+            let idx =
+                if_index(phy).with_context(|| format!("cannot resolve ifindex for {}", phy))?;
             let key = VifKey {
                 phy_ifindex: idx as u32,
                 vlan_id: *vlan_id,
@@ -618,26 +654,27 @@ impl EbpfHandle {
 
         // 下发 DNAT 规则（端口转发）：key=(WAN IP:端口, proto) -> 内部服务器。
         let mut dnat_map: HashMap<_, DnatKey, DnatValue> = HashMap::try_from(
-            ebpf.take_map("DNAT_RULES").context("DNAT_RULES map not found")?,
+            ebpf.take_map("DNAT_RULES")
+                .context("DNAT_RULES map not found")?,
         )?;
         for (i, dnat) in config.nat_rules.iter().enumerate() {
-            let key = DnatKey::from_ipv4(u32::from(dnat.dst_ip), dnat.dst_port.to_be(), dnat.proto_u8().expect("config validated"));
+            let key = DnatKey::from_ipv4(
+                u32::from(dnat.dst_ip),
+                dnat.dst_port.to_be(),
+                dnat.proto_u8().expect("config validated"),
+            );
             let value = DnatValue::from_ipv4(u32::from(dnat.to_ip), dnat.to_port.to_be());
             dnat_map.insert(key, value, 0)?;
             info!(
                 "DNAT[{}] {}:{} {} -> {}:{}",
-                i,
-                dnat.dst_ip,
-                dnat.dst_port,
-                dnat.proto,
-                dnat.to_ip,
-                dnat.to_port
+                i, dnat.dst_ip, dnat.dst_port, dnat.proto, dnat.to_ip, dnat.to_port
             );
         }
 
         // 源 IP 速率限制：预填令牌桶条目（LRU map，未配置的源 IP 不设限速）。
         let mut rate_map: HashMap<_, IpKey, RateState> = HashMap::try_from(
-            ebpf.take_map("RATE_LIMITS").context("RATE_LIMITS map not found")?,
+            ebpf.take_map("RATE_LIMITS")
+                .context("RATE_LIMITS map not found")?,
         )?;
         for rl in &config.rate_limit_rules {
             let key = match rl.src_ip {
@@ -653,23 +690,36 @@ impl EbpfHandle {
 
         // 每源 IP 并发连接数上限：预填 CONN_LIMITS（未配置的源 IP 不限制）。
         let mut conn_map: HashMap<_, IpKey, ConnLimit> = HashMap::try_from(
-            ebpf.take_map("CONN_LIMITS").context("CONN_LIMITS map not found")?,
+            ebpf.take_map("CONN_LIMITS")
+                .context("CONN_LIMITS map not found")?,
         )?;
         for cl in &config.conn_limits {
             let key = match cl.src_ip {
                 IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
                 IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
             };
-            conn_map.insert(key, ConnLimit { max_conns: cl.max_conns }, 0)?;
+            conn_map.insert(
+                key,
+                ConnLimit {
+                    max_conns: cl.max_conns,
+                },
+                0,
+            )?;
             info!("CONN LIMIT {}: max {} conns", cl.src_ip, cl.max_conns);
         }
 
         // 会话日志：取出 SESSION_LOG RingBuf，若启用则启动异步消费任务。
         if config.session_log.enabled {
-            match ebpf.take_map("SESSION_LOG").context("SESSION_LOG map not found") {
+            match ebpf
+                .take_map("SESSION_LOG")
+                .context("SESSION_LOG map not found")
+            {
                 Ok(map) => {
                     spawn_session_logger(map, &config.session_log);
-                    info!("session logging enabled (syslog: {})", config.session_log.syslog_enabled);
+                    info!(
+                        "session logging enabled (syslog: {})",
+                        config.session_log.syslog_enabled
+                    );
                 }
                 Err(e) => warn!("session logging skipped: {e}"),
             }
@@ -693,14 +743,16 @@ impl EbpfHandle {
 
         // Suricata 规则头预过滤表常驻句柄：运行时全量重同步复用，避免重复 take_map。
         let suricata_rules_dst: LpmTrie<MapData, [u8; 13], u8> = LpmTrie::try_from(
-            ebpf.take_map("SURICATA_RULES_DST").context("SURICATA_RULES_DST map not found")?,
+            ebpf.take_map("SURICATA_RULES_DST")
+                .context("SURICATA_RULES_DST map not found")?,
         )?;
         let suricata_rules_dst_any: LpmTrie<MapData, [u8; 9], u8> = LpmTrie::try_from(
             ebpf.take_map("SURICATA_RULES_DST_ANY")
                 .context("SURICATA_RULES_DST_ANY map not found")?,
         )?;
         let suricata_rules_src: LpmTrie<MapData, [u8; 13], u8> = LpmTrie::try_from(
-            ebpf.take_map("SURICATA_RULES_SRC").context("SURICATA_RULES_SRC map not found")?,
+            ebpf.take_map("SURICATA_RULES_SRC")
+                .context("SURICATA_RULES_SRC map not found")?,
         )?;
         let suricata_rules_src_any: LpmTrie<MapData, [u8; 9], u8> = LpmTrie::try_from(
             ebpf.take_map("SURICATA_RULES_SRC_ANY")
@@ -750,7 +802,9 @@ impl EbpfHandle {
         }
         let enabled = prefilter && !tuples.is_empty();
         let mut config_map: Array<_, u32> = Array::try_from(
-            self.ebpf.map_mut("CONFIG").context("CONFIG map not found")?,
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
         )?;
         config_map.set(CONFIG_SURICATA_PREFILTER, if enabled { 1 } else { 0 }, 0)?;
         info!(
@@ -767,8 +821,11 @@ impl EbpfHandle {
 
     /// 封禁一个源 IP（IPv4 / IPv6）。过期清理由 daemon 的 prune 任务负责从 map 中移除。
     pub fn block(&mut self, ip: IpAddr) -> Result<()> {
-        let mut map: HashMap<_, IpKey, u64> =
-            HashMap::try_from(self.ebpf.map_mut("BLOCKED").context("BLOCKED map not found")?)?;
+        let mut map: HashMap<_, IpKey, u64> = HashMap::try_from(
+            self.ebpf
+                .map_mut("BLOCKED")
+                .context("BLOCKED map not found")?,
+        )?;
         let key = match ip {
             IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
             IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
@@ -778,8 +835,11 @@ impl EbpfHandle {
     }
 
     pub fn unblock(&mut self, ip: IpAddr) -> Result<()> {
-        let mut map: HashMap<_, IpKey, u64> =
-            HashMap::try_from(self.ebpf.map_mut("BLOCKED").context("BLOCKED map not found")?)?;
+        let mut map: HashMap<_, IpKey, u64> = HashMap::try_from(
+            self.ebpf
+                .map_mut("BLOCKED")
+                .context("BLOCKED map not found")?,
+        )?;
         let key = match ip {
             IpAddr::V4(a) => IpKey::from_ipv4(u32::from(a)),
             IpAddr::V6(a) => IpKey::from_ipv6(a.octets()),
@@ -809,8 +869,11 @@ impl EbpfHandle {
     }
 
     /// 清理过期的连接跟踪条目，返回清理条数。
-    pub fn prune_conntrack(&mut self, cfg: &Conntrack) -> Result<u64> {        let mut map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
-            self.ebpf.map_mut("CONNTRACK").context("CONNTRACK map not found")?,
+    pub fn prune_conntrack(&mut self, cfg: &Conntrack) -> Result<u64> {
+        let mut map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
+            self.ebpf
+                .map_mut("CONNTRACK")
+                .context("CONNTRACK map not found")?,
         )?;
         let timeouts = cfg.timeouts();
         let now = monotonic_ns();
@@ -862,9 +925,7 @@ impl EbpfHandle {
         }
         let stale: Vec<FiveTuple> = meta
             .iter()
-            .filter(|(_, m)| {
-                now > m.last_updated && now - m.last_updated > max_timeout_ns
-            })
+            .filter(|(_, m)| now > m.last_updated && now - m.last_updated > max_timeout_ns)
             .map(|(k, _)| *k)
             .collect();
         for k in stale {
@@ -875,7 +936,9 @@ impl EbpfHandle {
     /// 导出全部连接跟踪会话（`/api/v1/operational/sessions`）。
     pub fn dump_sessions(&mut self) -> Result<Vec<k_firewall_common::api::SessionOut>> {
         let map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
-            self.ebpf.map_mut("CONNTRACK").context("CONNTRACK map not found")?,
+            self.ebpf
+                .map_mut("CONNTRACK")
+                .context("CONNTRACK map not found")?,
         )?;
         let meta = self.session_meta.lock().unwrap();
         let now = monotonic_ns();
@@ -948,7 +1011,9 @@ impl EbpfHandle {
         filter: &k_firewall_common::api::SessionDeleteRequest,
     ) -> Result<usize> {
         let mut map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
-            self.ebpf.map_mut("CONNTRACK").context("CONNTRACK map not found")?,
+            self.ebpf
+                .map_mut("CONNTRACK")
+                .context("CONNTRACK map not found")?,
         )?;
         let fam: Option<bool> = match filter.family.as_deref() {
             Some("ipv6") => Some(false),
@@ -961,8 +1026,16 @@ impl EbpfHandle {
             .as_deref()
             .map(|p| proto_name_to_u8(p).map_err(|_| anyhow!("bad proto: {p}")))
             .transpose()?;
-        let want_src = filter.src_ip.as_deref().map(ip_string_to_bytes).transpose()?;
-        let want_dst = filter.dst_ip.as_deref().map(ip_string_to_bytes).transpose()?;
+        let want_src = filter
+            .src_ip
+            .as_deref()
+            .map(ip_string_to_bytes)
+            .transpose()?;
+        let want_dst = filter
+            .dst_ip
+            .as_deref()
+            .map(ip_string_to_bytes)
+            .transpose()?;
         let src_cidr = filter
             .src_cidr
             .as_deref()
@@ -1051,7 +1124,9 @@ impl EbpfHandle {
         let key = session_key_from_full_id(session_id)
             .ok_or_else(|| anyhow!("invalid session_id {session_id:?}"))?;
         let mut map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
-            self.ebpf.map_mut("CONNTRACK").context("CONNTRACK map not found")?,
+            self.ebpf
+                .map_mut("CONNTRACK")
+                .context("CONNTRACK map not found")?,
         )?;
         let mut removed = 0;
         for k in [key, key.reverse()] {
@@ -1069,18 +1144,30 @@ impl EbpfHandle {
     }
 
     /// 读取 Suricata 规则头预过滤状态（`GET /api/v1/suricata/prefilter/stats`）。
-    pub fn read_prefilter_stats(&mut self) -> Result<k_firewall_common::api::SuricataPrefilterStats> {
+    pub fn read_prefilter_stats(
+        &mut self,
+    ) -> Result<k_firewall_common::api::SuricataPrefilterStats> {
         let mut config_map: Array<_, u32> = Array::try_from(
-            self.ebpf.map_mut("CONFIG").context("CONFIG map not found")?,
+            self.ebpf
+                .map_mut("CONFIG")
+                .context("CONFIG map not found")?,
         )?;
         let enabled = config_map.get(&CONFIG_SURICATA_PREFILTER, 0)? != 0;
-        let dst = self.suricata_rules_dst.keys().filter_map(|r| r.ok()).count() as u64;
+        let dst = self
+            .suricata_rules_dst
+            .keys()
+            .filter_map(|r| r.ok())
+            .count() as u64;
         let dst_any = self
             .suricata_rules_dst_any
             .keys()
             .filter_map(|r| r.ok())
             .count() as u64;
-        let src = self.suricata_rules_src.keys().filter_map(|r| r.ok()).count() as u64;
+        let src = self
+            .suricata_rules_src
+            .keys()
+            .filter_map(|r| r.ok())
+            .count() as u64;
         let src_any = self
             .suricata_rules_src_any
             .keys()
@@ -1098,8 +1185,11 @@ impl EbpfHandle {
     }
 
     /// 清理过期的分片流跟踪条目，返回清理条数。
-    pub fn prune_frag_track(&mut self, timeout_secs: u64) -> Result<u64> {        let mut map: HashMap<_, FragKey, u64> = HashMap::try_from(
-            self.ebpf.map_mut("FRAG_TRACK").context("FRAG_TRACK map not found")?,
+    pub fn prune_frag_track(&mut self, timeout_secs: u64) -> Result<u64> {
+        let mut map: HashMap<_, FragKey, u64> = HashMap::try_from(
+            self.ebpf
+                .map_mut("FRAG_TRACK")
+                .context("FRAG_TRACK map not found")?,
         )?;
         let now = monotonic_ns();
         let timeout_ns = timeout_secs.saturating_mul(1_000_000_000);
@@ -1126,7 +1216,9 @@ impl EbpfHandle {
         // 阶段 1：读 CONNTRACK 内容到用户态（borrow 随闭包结束释放）。
         let snap: Vec<(FiveTuple, CtValue)> = {
             let mut ct_map: HashMap<_, FiveTuple, CtValue> = HashMap::try_from(
-                self.ebpf.map_mut("CONNTRACK").context("CONNTRACK map not found")?,
+                self.ebpf
+                    .map_mut("CONNTRACK")
+                    .context("CONNTRACK map not found")?,
             )?;
             ct_map.iter().filter_map(|r| r.ok()).collect()
         };
@@ -1138,7 +1230,8 @@ impl EbpfHandle {
             }
             let src = match k.family {
                 k_firewall_common::maps::FAMILY_IPV4 => {
-                    let a = u32::from_be_bytes([k.src_ip[0], k.src_ip[1], k.src_ip[2], k.src_ip[3]]);
+                    let a =
+                        u32::from_be_bytes([k.src_ip[0], k.src_ip[1], k.src_ip[2], k.src_ip[3]]);
                     IpKey::from_ipv4(a)
                 }
                 _ => IpKey::from_ipv6(k.src_ip),
@@ -1153,9 +1246,15 @@ impl EbpfHandle {
         // 阶段 2：覆盖写回 CONN_COUNT（先清空再写，保证被删除连接来源的计数归零）。
         {
             let mut conn_map: HashMap<_, IpKey, u32> = HashMap::try_from(
-                self.ebpf.map_mut("CONN_COUNT").context("CONN_COUNT map not found")?,
+                self.ebpf
+                    .map_mut("CONN_COUNT")
+                    .context("CONN_COUNT map not found")?,
             )?;
-            let keys: Vec<IpKey> = conn_map.iter().filter_map(|r| r.ok()).map(|(k, _)| k).collect();
+            let keys: Vec<IpKey> = conn_map
+                .iter()
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k)
+                .collect();
             for k in keys {
                 let _ = conn_map.remove(&k);
             }
@@ -1166,9 +1265,15 @@ impl EbpfHandle {
         // 阶段 3：覆盖写回 SYN_COUNT。
         {
             let mut syn_map: HashMap<_, IpKey, u32> = HashMap::try_from(
-                self.ebpf.map_mut("SYN_COUNT").context("SYN_COUNT map not found")?,
+                self.ebpf
+                    .map_mut("SYN_COUNT")
+                    .context("SYN_COUNT map not found")?,
             )?;
-            let keys: Vec<IpKey> = syn_map.iter().filter_map(|r| r.ok()).map(|(k, _)| k).collect();
+            let keys: Vec<IpKey> = syn_map
+                .iter()
+                .filter_map(|r| r.ok())
+                .map(|(k, _)| k)
+                .collect();
             for k in keys {
                 let _ = syn_map.remove(&k);
             }
@@ -1211,7 +1316,8 @@ fn spawn_suricata_listener(
     )?;
     // FTP 数据连接预期表：daemon 依据 Suricata ftp 事件写入（src_port=0 通配）。
     let mut alg_expect: HashMap<MapData, FiveTuple, AlgExpect> = HashMap::try_from(
-        ebpf.take_map("ALG_EXPECT").context("ALG_EXPECT map not found")?,
+        ebpf.take_map("ALG_EXPECT")
+            .context("ALG_EXPECT map not found")?,
     )?;
 
     let eve_socket = suricata.eve_socket.clone();
@@ -1248,7 +1354,10 @@ fn spawn_suricata_listener(
                 warn!(
                     "cannot connect eve socket {} , fallback to tail {}",
                     socket_path.display(),
-                    eve_file.as_deref().map(|p| p.display().to_string()).unwrap_or_default()
+                    eve_file
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
                 );
                 if let Some(ref file_path) = eve_file {
                     tail_eve_file(
@@ -1336,7 +1445,13 @@ fn process_suricata_event(
     }
 
     // 解析五元组（flow / tls / http / dns 事件都携带顶层 5 元组）。
-    let key = match (&event.src_ip, &event.dst_ip, &event.proto, &event.src_port, &event.dst_port) {
+    let key = match (
+        &event.src_ip,
+        &event.dst_ip,
+        &event.proto,
+        &event.src_port,
+        &event.dst_port,
+    ) {
         (Some(src_ip), Some(dst_ip), Some(proto), Some(src_port), Some(dst_port)) => {
             if let (Ok(s), Ok(d)) = (
                 src_ip.parse::<std::net::Ipv4Addr>(),
@@ -1366,7 +1481,12 @@ fn process_suricata_event(
     if event.flow.is_some() {
         debug!(
             "eve flow event: src={:?} dst={:?} sport={:?} dport={:?} proto={:?} app={:?}",
-            event.src_ip, event.dst_ip, event.src_port, event.dst_port, event.proto, event.app_proto
+            event.src_ip,
+            event.dst_ip,
+            event.src_port,
+            event.dst_port,
+            event.proto,
+            event.app_proto
         );
         if let Some(key) = &key {
             let _ = allow_map.insert(key, 1, 0);
@@ -1383,10 +1503,7 @@ fn process_suricata_event(
             }
         }
         if let Some(t) = event.tls.as_ref() {
-            meta.tls_fingerprint = t
-                .fingerprint
-                .clone()
-                .or_else(|| t.ja3.clone());
+            meta.tls_fingerprint = t.fingerprint.clone().or_else(|| t.ja3.clone());
             meta.tls_sni = t.sni.clone();
             if let Some(v) = t.version.as_ref() {
                 meta.app_info = Some(format!("TLS {v}"));
@@ -1397,10 +1514,7 @@ fn process_suricata_event(
             meta.http_user_agent = h.http_user_agent.clone();
             if let Some(m) = h.http_method.as_ref() {
                 let url = h.url.clone().unwrap_or_default();
-                let status = h
-                    .status
-                    .map(|s| format!(" {s}"))
-                    .unwrap_or_default();
+                let status = h.status.map(|s| format!(" {s}")).unwrap_or_default();
                 meta.app_info = Some(format!("{m} {url}{status}"));
             }
         }
@@ -1533,11 +1647,19 @@ impl CidrMatcher {
                 let mut net = [0u8; 16];
                 net[0..4].copy_from_slice(&a.octets());
                 let prefix = if prefix == 0 { 32 } else { prefix.min(32) };
-                Ok(Self { net, prefix, is_v4: true })
+                Ok(Self {
+                    net,
+                    prefix,
+                    is_v4: true,
+                })
             }
             IpAddr::V6(a) => {
                 let prefix = if prefix == 0 { 128 } else { prefix.min(128) };
-                Ok(Self { net: a.octets(), prefix, is_v4: false })
+                Ok(Self {
+                    net: a.octets(),
+                    prefix,
+                    is_v4: false,
+                })
             }
         }
     }
@@ -1583,11 +1705,15 @@ fn process_ftp_event(
     if port == 0 {
         return;
     }
-    let (Some(src_ip), Some(dst_ip)) = (&event.src_ip, &event.dst_ip) else { return };
+    let (Some(src_ip), Some(dst_ip)) = (&event.src_ip, &event.dst_ip) else {
+        return;
+    };
     let (Ok(s), Ok(d)) = (
         src_ip.parse::<std::net::Ipv4Addr>(),
         dst_ip.parse::<std::net::Ipv4Addr>(),
-    ) else { return };
+    ) else {
+        return;
+    };
 
     let cmd = ftp.command.as_deref().unwrap_or("");
     // 主动模式：Suricata 的 `mode` 为 "active"（PORT/EPRT 命令）；命令名兜底。
@@ -1601,7 +1727,9 @@ fn process_ftp_event(
         // 被动：数据连接同向（client -> server:port）。
         FiveTuple::from_ipv4(u32::from(s), u32::from(d), 6, 0, port)
     };
-    let exp = AlgExpect { expire_ns: monotonic_ns() + FTP_EXPECT_TTL_NS };
+    let exp = AlgExpect {
+        expire_ns: monotonic_ns() + FTP_EXPECT_TTL_NS,
+    };
     match alg_expect.insert(&key, &exp, 0) {
         Ok(_) => info!(
             "SURICATA ftp {} expect src={} dport={} mode={}",
@@ -1613,4 +1741,3 @@ fn process_ftp_event(
         Err(e) => debug!("insert ALG_EXPECT {key:?} failed: {e}"),
     }
 }
-

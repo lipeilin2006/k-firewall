@@ -1,32 +1,32 @@
-﻿#![no_std]
+#![no_std]
 #![no_main]
 #![allow(nonstandard_style, dead_code)]
 
+use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::{
     bindings,
     bindings::xdp_action,
     macros::{classifier, map, xdp},
     maps::{
-        lpm_trie::LpmTrie, lpm_trie::Key as LpmKey, Array, DevMap, HashMap, LruHashMap, PerCpuArray,
-        RingBuf,
+        Array, DevMap, HashMap, LruHashMap, PerCpuArray, RingBuf, lpm_trie::Key as LpmKey,
+        lpm_trie::LpmTrie,
     },
     programs::{TcContext, XdpContext},
 };
-use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_log_ebpf::info;
 use core::mem;
 use k_firewall_common::maps::{
-    AlgExpect, ConnLimit, CtValue, DnatKey, DnatValue, FiveTuple, FragKey,
-    IpKey, QosBucket, RateState, SessionEvent, SynState, VifConfig, VifKey,
-    CT_COUNTED_CONN, CT_COUNTED_SYN, CT_STATE_GENERIC, CT_STATE_ICMP, CT_STATE_TCP_ESTABLISHED,
-    CT_STATE_TCP_FIN_WAIT, CT_STATE_TCP_SYN_RECV, CT_STATE_TCP_SYN_SENT, CT_STATE_TCP_TIME_WAIT,
-    CT_STATE_UDP, FRAG_POLICY_DROP, FRAG_POLICY_INSPECT, MODE_HYBRID, MODE_ROUTE,
-    MODE_TRANSPARENT, ROLE_LAN, SESSION_BLOCKED, SESSION_DROP, SESSION_NEW,
+    AlgExpect, CT_COUNTED_CONN, CT_COUNTED_SYN, CT_STATE_GENERIC, CT_STATE_ICMP,
+    CT_STATE_TCP_ESTABLISHED, CT_STATE_TCP_FIN_WAIT, CT_STATE_TCP_SYN_RECV, CT_STATE_TCP_SYN_SENT,
+    CT_STATE_TCP_TIME_WAIT, CT_STATE_UDP, ConnLimit, CtValue, DnatKey, DnatValue, FRAG_POLICY_DROP,
+    FRAG_POLICY_INSPECT, FiveTuple, FragKey, IpKey, MODE_HYBRID, MODE_ROUTE, MODE_TRANSPARENT,
+    QosBucket, ROLE_LAN, RateState, SESSION_BLOCKED, SESSION_DROP, SESSION_NEW, SessionEvent,
+    SynState, VifConfig, VifKey,
 };
 use k_firewall_common::{
-    Stats, ACTION_DROP, ACTION_PASS, CONFIG_DEFAULT_ACTION, CONFIG_FRAGMENT_POLICY,
-    CONFIG_FRAG_TIMEOUT, CONFIG_FTP_ALG, CONFIG_QOS_COUNT, CONFIG_RA_FILTER, CONFIG_SURICATA_PREFILTER,
-    CONFIG_SYN_BURST, CONFIG_SYN_MAX_HALFOPEN, CONFIG_SYN_RATE,
+    ACTION_DROP, ACTION_PASS, CONFIG_DEFAULT_ACTION, CONFIG_FRAG_TIMEOUT, CONFIG_FRAGMENT_POLICY,
+    CONFIG_FTP_ALG, CONFIG_QOS_COUNT, CONFIG_RA_FILTER, CONFIG_SURICATA_PREFILTER,
+    CONFIG_SYN_BURST, CONFIG_SYN_MAX_HALFOPEN, CONFIG_SYN_RATE, Stats,
 };
 use network_types::{
     eth::{EthHdr, EtherType},
@@ -111,7 +111,8 @@ static CONNTRACK: HashMap<FiveTuple, CtValue> = HashMap::with_max_entries(65536,
 
 /// 每状态超时（秒）：槽位 = `CT_STATE_*`。daemon 启动时按配置写入。
 #[map]
-static CT_TIMEOUTS: Array<u32> = Array::with_max_entries(k_firewall_common::maps::CT_STATE_MAX as u32, 0);
+static CT_TIMEOUTS: Array<u32> =
+    Array::with_max_entries(k_firewall_common::maps::CT_STATE_MAX as u32, 0);
 
 /// 分片流跟踪：`(src, dst, proto)` -> 最近活跃时刻（ns）。孤儿分片检测。
 #[map]
@@ -235,9 +236,26 @@ fn bump_stats(passed: bool, blocked: bool) {
 
 /// 向 `SESSION_LOG` 写入一条会话事件（新建 / 丢包 / 封禁）。
 #[inline(always)]
-fn log_session(action: u8, is_ipv4: bool, proto: u8, ifindex: usize, src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16) {
+fn log_session(
+    action: u8,
+    is_ipv4: bool,
+    proto: u8,
+    ifindex: usize,
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+) {
     let ev = if is_ipv4 {
-        SessionEvent::ipv4(action, proto, ifindex as u32, src_ip, dst_ip, src_port, dst_port)
+        SessionEvent::ipv4(
+            action,
+            proto,
+            ifindex as u32,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+        )
     } else {
         return;
     };
@@ -246,8 +264,24 @@ fn log_session(action: u8, is_ipv4: bool, proto: u8, ifindex: usize, src_ip: u32
 
 /// IPv6 版：源/目的为 16 字节。
 #[inline(always)]
-fn log_session_v6(action: u8, proto: u8, ifindex: usize, src_ip: [u8; 16], dst_ip: [u8; 16], src_port: u16, dst_port: u16) {
-    let ev = SessionEvent::ipv6(action, proto, ifindex as u32, src_ip, dst_ip, src_port, dst_port);
+fn log_session_v6(
+    action: u8,
+    proto: u8,
+    ifindex: usize,
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+) {
+    let ev = SessionEvent::ipv6(
+        action,
+        proto,
+        ifindex as u32,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+    );
     let _ = SESSION_LOG.output::<SessionEvent>(&ev, 0);
 }
 
@@ -342,7 +376,13 @@ fn conn_count_dec(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16]) {
 ///
 /// 只对 TCP 新建（SYN 且非回程）调用。任一超限返回 `true`（丢弃）。
 #[inline(always)]
-fn syn_flood_check(ctx: &XdpContext, is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], now: u64) -> bool {
+fn syn_flood_check(
+    ctx: &XdpContext,
+    is_ipv4: bool,
+    src_ip: u32,
+    src_ip6: [u8; 16],
+    now: u64,
+) -> bool {
     let rate = CONFIG.get(CONFIG_SYN_RATE).copied().unwrap_or(0);
     let burst = CONFIG.get(CONFIG_SYN_BURST).copied().unwrap_or(0);
     let max_half = CONFIG.get(CONFIG_SYN_MAX_HALFOPEN).copied().unwrap_or(0);
@@ -375,7 +415,10 @@ fn syn_flood_check(ctx: &XdpContext, is_ipv4: bool, src_ip: u32, src_ip6: [u8; 1
                 state.tokens -= 1;
             }
             None => {
-                let st = SynState { last: now, tokens: burst.saturating_sub(1) };
+                let st = SynState {
+                    last: now,
+                    tokens: burst.saturating_sub(1),
+                };
                 let _ = SYN_LIMITS.insert(&key, &st, 0);
             }
         }
@@ -542,7 +585,14 @@ fn ct_initial_state(proto: u8, flags: u8, reply: bool) -> u8 {
 ///
 /// 返回 `true` 表示超出该类速率应丢弃。
 #[inline(always)]
-fn apply_qos(ctx: &XdpContext, l3_off: usize, is_ipv4: bool, proto: u8, src_port: u16, dst_port: u16) -> bool {
+fn apply_qos(
+    ctx: &XdpContext,
+    l3_off: usize,
+    is_ipv4: bool,
+    proto: u8,
+    src_port: u16,
+    dst_port: u16,
+) -> bool {
     let count = CONFIG.get(CONFIG_QOS_COUNT).copied().unwrap_or(0);
     if count == 0 {
         return false;
@@ -622,10 +672,9 @@ fn mark_ipv4_dscp(ctx: &XdpContext, l3_off: usize, dscp: u8) {
         Err(_) => return,
     };
     // 校验和（字节 10..12）。
-    let (Ok(c0), Ok(c1)) = (
-        unsafe { ptr_at::<u8>(ctx, l3_off + 10) },
-        unsafe { ptr_at::<u8>(ctx, l3_off + 11) },
-    ) else {
+    let (Ok(c0), Ok(c1)) = (unsafe { ptr_at::<u8>(ctx, l3_off + 10) }, unsafe {
+        ptr_at::<u8>(ctx, l3_off + 11)
+    }) else {
         return;
     };
     let hc: u32 = (((unsafe { *c0 }) as u32) << 8) | (unsafe { *c1 }) as u32;
@@ -696,7 +745,15 @@ fn read_ports(ctx: &XdpContext, l4_off: usize, proto: u8) -> Result<(u16, u16), 
 
 /// 更新 `FRAG_TRACK` 分片流活跃时刻（供孤儿分片放行判断）。
 #[inline(always)]
-fn frag_track_update(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], dst_ip: u32, dst_ip6: [u8; 16], proto: u8, now: u64) {
+fn frag_track_update(
+    is_ipv4: bool,
+    src_ip: u32,
+    src_ip6: [u8; 16],
+    dst_ip: u32,
+    dst_ip6: [u8; 16],
+    proto: u8,
+    now: u64,
+) {
     let key = if is_ipv4 {
         FragKey::from_ipv4(src_ip, dst_ip, proto)
     } else {
@@ -707,7 +764,15 @@ fn frag_track_update(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], dst_ip: u32,
 
 /// 查询分片流是否已知（未过期）。
 #[inline(always)]
-fn frag_track_known(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], dst_ip: u32, dst_ip6: [u8; 16], proto: u8, now: u64) -> bool {
+fn frag_track_known(
+    is_ipv4: bool,
+    src_ip: u32,
+    src_ip6: [u8; 16],
+    dst_ip: u32,
+    dst_ip6: [u8; 16],
+    proto: u8,
+    now: u64,
+) -> bool {
     let key = if is_ipv4 {
         FragKey::from_ipv4(src_ip, dst_ip, proto)
     } else {
@@ -715,7 +780,8 @@ fn frag_track_known(is_ipv4: bool, src_ip: u32, src_ip6: [u8; 16], dst_ip: u32, 
     };
     match unsafe { FRAG_TRACK.get(&key) } {
         Some(last) => {
-            let timeout = CONFIG.get(CONFIG_FRAG_TIMEOUT).copied().unwrap_or(60) as u64;            let timeout_ns = timeout * 1_000_000_000;
+            let timeout = CONFIG.get(CONFIG_FRAG_TIMEOUT).copied().unwrap_or(60) as u64;
+            let timeout_ns = timeout * 1_000_000_000;
             now <= *last || now - *last <= timeout_ns
         }
         None => false,
@@ -860,8 +926,16 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         // 分片：MF 标志（frag_flags & 0x1）或非零偏移。
         let frag_flags = unsafe { (*ipv4hdr).frag_flags() };
         let frag_offset = unsafe { (*ipv4hdr).frag_offset() };
-        let is_fragmented = if frag_offset != 0 || (frag_flags & 0x1) != 0 { 1 } else { 0 };
-        let is_first = if frag_offset == 0 && (frag_flags & 0x1) != 0 { 1 } else { 0 };
+        let is_fragmented = if frag_offset != 0 || (frag_flags & 0x1) != 0 {
+            1
+        } else {
+            0
+        };
+        let is_first = if frag_offset == 0 && (frag_flags & 0x1) != 0 {
+            1
+        } else {
+            0
+        };
         (
             u32::from_be_bytes(src_addr),
             u32::from_be_bytes(dst_addr),
@@ -869,7 +943,10 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
             l3_off + iphdr_len,
             sp,
             dp,
-            FragInfo { is_fragmented, is_first },
+            FragInfo {
+                is_fragmented,
+                is_first,
+            },
         )
     } else {
         let ipv6hdr: *const Ipv6Hdr = unsafe { ptr_at(&ctx, l3_off)? };
@@ -946,12 +1023,23 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
             l4_off,
             sp,
             dp,
-            FragInfo { is_fragmented, is_first },
+            FragInfo {
+                is_fragmented,
+                is_first,
+            },
         )
     };
 
-    let src_ip6: [u8; 16] = if is_ipv4 { [0; 16] } else { unsafe { *ptr_at::<Ipv6Hdr>(&ctx, l3_off)? }.src_addr };
-    let dst_ip6: [u8; 16] = if is_ipv4 { [0; 16] } else { unsafe { *ptr_at::<Ipv6Hdr>(&ctx, l3_off)? }.dst_addr };
+    let src_ip6: [u8; 16] = if is_ipv4 {
+        [0; 16]
+    } else {
+        unsafe { *ptr_at::<Ipv6Hdr>(&ctx, l3_off)? }.src_addr
+    };
+    let dst_ip6: [u8; 16] = if is_ipv4 {
+        [0; 16]
+    } else {
+        unsafe { *ptr_at::<Ipv6Hdr>(&ctx, l3_off)? }.dst_addr
+    };
 
     // 快速路径：封禁源 IP 表。
     if is_ipv4 {
@@ -959,7 +1047,16 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         if unsafe { BLOCKED.get(&block_key).is_some() } {
             bump_stats(false, true);
             info!(&ctx, "BLOCKED family=4 src={:i}", src_ip);
-            log_session(SESSION_BLOCKED, true, proto, ctx.ingress_ifindex(), src_ip, dst_ip, src_port, dst_port);
+            log_session(
+                SESSION_BLOCKED,
+                true,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+            );
             return Ok(xdp_action::XDP_DROP);
         }
     } else {
@@ -967,21 +1064,22 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         if unsafe { BLOCKED.get(&block_key).is_some() } {
             bump_stats(false, true);
             info!(&ctx, "BLOCKED family=6 src={:i}", src_ip6);
-            log_session_v6(SESSION_BLOCKED, proto, ctx.ingress_ifindex(), src_ip6, dst_ip6, src_port, dst_port);
+            log_session_v6(
+                SESSION_BLOCKED,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip6,
+                dst_ip6,
+                src_port,
+                dst_port,
+            );
             return Ok(xdp_action::XDP_DROP);
         }
     }
 
     // 分片策略。
     if let Some(ret) = handle_fragments(
-        &ctx,
-        &frag,
-        is_ipv4,
-        src_ip,
-        src_ip6,
-        dst_ip,
-        dst_ip6,
-        proto,
+        &ctx, &frag, is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto,
     ) {
         return Ok(ret);
     }
@@ -997,7 +1095,15 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         if icmp6_type == ICMPV6_RA || icmp6_type == ICMPV6_REDIRECT {
             bump_stats(false, false);
             info!(&ctx, "ND FILTER icmp6_type={}", icmp6_type);
-            log_session_v6(SESSION_DROP, proto, ctx.ingress_ifindex(), src_ip6, dst_ip6, src_port, dst_port);
+            log_session_v6(
+                SESSION_DROP,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip6,
+                dst_ip6,
+                src_port,
+                dst_port,
+            );
             return Ok(xdp_action::XDP_DROP);
         }
     }
@@ -1035,14 +1141,25 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
     let now = unsafe { bpf_ktime_get_ns() };
     if rate_limited(is_ipv4, src_ip, src_ip6, now) {
         bump_stats(false, false);
-        info!(&ctx, "RATE LIMIT family={} src={:i}", if is_ipv4 { 4 } else { 6 }, src_ip);
+        info!(
+            &ctx,
+            "RATE LIMIT family={} src={:i}",
+            if is_ipv4 { 4 } else { 6 },
+            src_ip
+        );
         return Ok(xdp_action::XDP_DROP);
     }
 
     // QoS：DSCP 标记 + 每类入口限速（放行路径上所有包，含已建连接）。
     if apply_qos(&ctx, l3_off, is_ipv4, proto, src_port, dst_port) {
         bump_stats(false, false);
-        info!(&ctx, "QOS LIMIT family={} proto={} dport={}", if is_ipv4 { 4 } else { 6 }, proto, dst_port);
+        info!(
+            &ctx,
+            "QOS LIMIT family={} proto={} dport={}",
+            if is_ipv4 { 4 } else { 6 },
+            proto,
+            dst_port
+        );
         return Ok(xdp_action::XDP_DROP);
     }
 
@@ -1068,7 +1185,9 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
             nv.last_seen = now;
             nv.packets = v.packets.saturating_add(1);
             nv.pkts_orig = v.pkts_orig.saturating_add(1);
-            nv.bytes_orig = v.bytes_orig.saturating_add((ctx.data_end() - ctx.data()) as u64);
+            nv.bytes_orig = v
+                .bytes_orig
+                .saturating_add((ctx.data_end() - ctx.data()) as u64);
             // P0：半开握手完成 / 连接关闭时回收每源计数。
             ct_counters_tick(&mut nv, cur, new_state, is_ipv4, src_ip, src_ip6);
             if frag.is_fragmented != 0 {
@@ -1098,7 +1217,9 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
             nv.last_seen = now;
             nv.packets = v.packets.saturating_add(1);
             nv.pkts_repl = v.pkts_repl.saturating_add(1);
-            nv.bytes_repl = v.bytes_repl.saturating_add((ctx.data_end() - ctx.data()) as u64);
+            nv.bytes_repl = v
+                .bytes_repl
+                .saturating_add((ctx.data_end() - ctx.data()) as u64);
             // P0：半开握手完成 / 连接关闭时回收每源计数（反向路径用 dst 即正向 src）。
             ct_counters_tick(&mut nv, v.state, new_state, is_ipv4, dst_ip, dst_ip6);
             if frag.is_fragmented != 0 {
@@ -1106,7 +1227,15 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
                 frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
             }
             let _ = CONNTRACK.insert(&rev_key, &nv, 0);
-            info!(&ctx, "CT family={} proto={} sport={} dport={} state={} (reply)", if is_ipv4 { 4 } else { 6 }, proto, src_port, dst_port, new_state);
+            info!(
+                &ctx,
+                "CT family={} proto={} sport={} dport={} state={} (reply)",
+                if is_ipv4 { 4 } else { 6 },
+                proto,
+                src_port,
+                dst_port,
+                new_state
+            );
             bump_stats(true, false);
             return Ok(xdp_action::XDP_PASS);
         }
@@ -1118,13 +1247,17 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         // DnatKey 用户态以网络序写入（见 ebpf_loader），此处同样用网络序匹配。
         let dnat_key = DnatKey::from_ipv4(dst_ip, dst_port.to_be(), proto);
         if let Some(dnat) = unsafe { DNAT_RULES.get(&dnat_key) } {
-            let to_ip = u32::from_be_bytes([dnat.to_ip[0], dnat.to_ip[1], dnat.to_ip[2], dnat.to_ip[3]]);
+            let to_ip =
+                u32::from_be_bytes([dnat.to_ip[0], dnat.to_ip[1], dnat.to_ip[2], dnat.to_ip[3]]);
             let to_port = u16::from_be(dnat.to_port);
             let reply_key = FiveTuple::from_ipv4(to_ip, src_ip, proto, to_port, src_port);
             let mut rv = CtValue::nat_reply();
             rv.last_seen = now;
             if CONNTRACK.insert(&reply_key, &rv, 0).is_ok() {
-                info!(&ctx, "DNAT dport={} to={:i}:{} reply_to={:i}", dst_port, to_ip, to_port, src_ip);
+                info!(
+                    &ctx,
+                    "DNAT dport={} to={:i}:{} reply_to={:i}", dst_port, to_ip, to_port, src_ip
+                );
             }
             bump_stats(true, false);
             return Ok(xdp_action::XDP_PASS);
@@ -1134,30 +1267,43 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
     // FTP ALG：数据连接命中 ALG_EXPECT（含 src_port=0 通配）即视为预期流量。
     // 预期条目由用户态 daemon 依据 Suricata eve `ftp` 事件写入；此检查放在
     // Zone/Rules 之前，确保默认 deny 下预期数据连接仍可放行。
-    if CONFIG.get(CONFIG_FTP_ALG).copied().unwrap_or(0) != 0
-        && proto == IPPROTO_TCP && is_ipv4
-    {
+    if CONFIG.get(CONFIG_FTP_ALG).copied().unwrap_or(0) != 0 && proto == IPPROTO_TCP && is_ipv4 {
         let wild_key = FiveTuple::from_ipv4(src_ip, dst_ip, proto, 0, dst_port);
         if alg_expect_hit(&flow_key, now) || alg_expect_hit(&wild_key, now) {
             let _ = ALG_EXPECT.remove(&flow_key);
             let _ = ALG_EXPECT.remove(&wild_key);
             // 与放行路径一致：为数据连接插入 conntrack 条目，使 SYN 重传、
             // SYN-ACK 回程与后续数据包都能走 conntrack 快速路径（否则重传即被默认 deny 丢弃）。
-            let initial = ct_initial_state(proto, {
-                match unsafe { ptr_at::<u8>(&ctx, l4_off + 13) } {
-                    Ok(p) => unsafe { *p },
-                    Err(_) => 0,
-                }
-            }, false);
+            let initial = ct_initial_state(
+                proto,
+                {
+                    match unsafe { ptr_at::<u8>(&ctx, l4_off + 13) } {
+                        Ok(p) => unsafe { *p },
+                        Err(_) => 0,
+                    }
+                },
+                false,
+            );
             let mut nv = CtValue::new(initial);
             nv.last_seen = now;
             nv.pkts_orig = 1;
             nv.bytes_orig = (ctx.data_end() - ctx.data()) as u64;
             if CONNTRACK.insert(&flow_key, &nv, 0).is_ok() {
-                info!(&ctx, "CT NEW (alg) family={} proto={} sport={} dport={} state={}", 4, proto, src_port, dst_port, initial);
+                info!(
+                    &ctx,
+                    "CT NEW (alg) family={} proto={} sport={} dport={} state={}",
+                    4,
+                    proto,
+                    src_port,
+                    dst_port,
+                    initial
+                );
             }
             bump_stats(true, false);
-            info!(&ctx, "FTP ALG PASS family={} sport={} dport={}", 4, src_port, dst_port);
+            info!(
+                &ctx,
+                "FTP ALG PASS family={} sport={} dport={}", 4, src_port, dst_port
+            );
             return Ok(xdp_action::XDP_PASS);
         }
     }
@@ -1174,8 +1320,23 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         }
         if !pass {
             bump_stats(false, false);
-            info!(&ctx, "SURICATA PREFILTER DROP family=4 proto={} sport={} dport={}", proto, src_port, dst_port);
-            log_session(SESSION_DROP, true, proto, ctx.ingress_ifindex(), src_ip, dst_ip, src_port, dst_port);
+            info!(
+                &ctx,
+                "SURICATA PREFILTER DROP family=4 proto={} sport={} dport={}",
+                proto,
+                src_port,
+                dst_port
+            );
+            log_session(
+                SESSION_DROP,
+                true,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+            );
             return Ok(xdp_action::XDP_DROP);
         }
     }
@@ -1194,8 +1355,22 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
     match zone_action {
         Some(k_firewall_common::ACTION_DROP) => {
             bump_stats(false, false);
-            info!(&ctx, "ZONE DROP src_if={} dst={:i}", ctx.ingress_ifindex(), dst_ip);
-            log_session(SESSION_DROP, true, proto, ctx.ingress_ifindex(), src_ip, dst_ip, src_port, dst_port);
+            info!(
+                &ctx,
+                "ZONE DROP src_if={} dst={:i}",
+                ctx.ingress_ifindex(),
+                dst_ip
+            );
+            log_session(
+                SESSION_DROP,
+                true,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+            );
             return Ok(xdp_action::XDP_DROP);
         }
         Some(k_firewall_common::ACTION_PASS) => {
@@ -1207,44 +1382,97 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
 
     // 默认动作：所有流量统一走默认动作（由 `CONFIG_DEFAULT_ACTION` 控制）。
     // 规则引擎已整体迁移到用户态 Suricata DPI；eBPF 仅负责预过滤与默认动作。
-    let action = (CONFIG.get(CONFIG_DEFAULT_ACTION).copied().unwrap_or(ACTION_PASS as u32)) as u8;
+    let action = (CONFIG
+        .get(CONFIG_DEFAULT_ACTION)
+        .copied()
+        .unwrap_or(ACTION_PASS as u32)) as u8;
 
     if action == ACTION_DROP {
         bump_stats(false, false);
         if is_ipv4 {
-            info!(&ctx, "DROP family=4 src={:i} dst={:i} proto={} sport={} dport={}", src_ip, dst_ip, proto, src_port, dst_port);
-            log_session(SESSION_DROP, true, proto, ctx.ingress_ifindex(), src_ip, dst_ip, src_port, dst_port);
+            info!(
+                &ctx,
+                "DROP family=4 src={:i} dst={:i} proto={} sport={} dport={}",
+                src_ip,
+                dst_ip,
+                proto,
+                src_port,
+                dst_port
+            );
+            log_session(
+                SESSION_DROP,
+                true,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+            );
         } else {
-            info!(&ctx, "DROP family=6 src={:i} dst={:i} proto={} sport={} dport={}", src_ip6, dst_ip6, proto, src_port, dst_port);
-            log_session_v6(SESSION_DROP, proto, ctx.ingress_ifindex(), src_ip6, dst_ip6, src_port, dst_port);
+            info!(
+                &ctx,
+                "DROP family=6 src={:i} dst={:i} proto={} sport={} dport={}",
+                src_ip6,
+                dst_ip6,
+                proto,
+                src_port,
+                dst_port
+            );
+            log_session_v6(
+                SESSION_DROP,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip6,
+                dst_ip6,
+                src_port,
+                dst_port,
+            );
         }
         return Ok(xdp_action::XDP_DROP);
     }
 
     // 新建流首包：记录连接（初始状态由协议/标志位决定），并登记分片流。
-    let initial = ct_initial_state(proto, {
-        if proto == IPPROTO_TCP {
-            match unsafe { ptr_at::<u8>(&ctx, l4_off + 13) } {
-                Ok(p) => unsafe { *p },
-                Err(_) => 0,
+    let initial = ct_initial_state(
+        proto,
+        {
+            if proto == IPPROTO_TCP {
+                match unsafe { ptr_at::<u8>(&ctx, l4_off + 13) } {
+                    Ok(p) => unsafe { *p },
+                    Err(_) => 0,
+                }
+            } else {
+                0
             }
-        } else {
-            0
-        }
-    }, false);
+        },
+        false,
+    );
 
     // P0：SYN Flood 防护（仅对 TCP 新建 SYN；通过则计入半开数）。
     let tcp_syn = proto == IPPROTO_TCP && initial == CT_STATE_TCP_SYN_SENT;
     if tcp_syn && syn_flood_check(&ctx, is_ipv4, src_ip, src_ip6, now) {
         bump_stats(false, false);
-        info!(&ctx, "SYN FLOOD DROP family={} src={:i} sport={} dport={}", if is_ipv4 { 4 } else { 6 }, src_ip, src_port, dst_port);
+        info!(
+            &ctx,
+            "SYN FLOOD DROP family={} src={:i} sport={} dport={}",
+            if is_ipv4 { 4 } else { 6 },
+            src_ip,
+            src_port,
+            dst_port
+        );
         return Ok(xdp_action::XDP_DROP);
     }
 
     // P0：每源并发连接数上限（新建流计数）。
     if conn_limit_check(&ctx, is_ipv4, src_ip, src_ip6) {
         bump_stats(false, false);
-        info!(&ctx, "CONN LIMIT DROP family={} src={:i} proto={}", if is_ipv4 { 4 } else { 6 }, src_ip, proto);
+        info!(
+            &ctx,
+            "CONN LIMIT DROP family={} src={:i} proto={}",
+            if is_ipv4 { 4 } else { 6 },
+            src_ip,
+            proto
+        );
         return Ok(xdp_action::XDP_DROP);
     }
 
@@ -1261,11 +1489,36 @@ fn try_k_firewall(ctx: XdpContext) -> Result<u32, ()> {
         frag_track_update(is_ipv4, src_ip, src_ip6, dst_ip, dst_ip6, proto, now);
     }
     if CONNTRACK.insert(&flow_key, &nv, 0).is_ok() {
-        info!(&ctx, "CT NEW family={} proto={} sport={} dport={} state={}", if is_ipv4 { 4 } else { 6 }, proto, src_port, dst_port, initial);
+        info!(
+            &ctx,
+            "CT NEW family={} proto={} sport={} dport={} state={}",
+            if is_ipv4 { 4 } else { 6 },
+            proto,
+            src_port,
+            dst_port,
+            initial
+        );
         if is_ipv4 {
-            log_session(SESSION_NEW, true, proto, ctx.ingress_ifindex(), src_ip, dst_ip, src_port, dst_port);
+            log_session(
+                SESSION_NEW,
+                true,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+            );
         } else {
-            log_session_v6(SESSION_NEW, proto, ctx.ingress_ifindex(), src_ip6, dst_ip6, src_port, dst_port);
+            log_session_v6(
+                SESSION_NEW,
+                proto,
+                ctx.ingress_ifindex(),
+                src_ip6,
+                dst_ip6,
+                src_port,
+                dst_port,
+            );
         }
     }
 
@@ -1331,7 +1584,10 @@ pub fn kfw_tc_egress(ctx: TcContext) -> i32 {
         let mut nv = CtValue::nat_reply();
         nv.last_seen = now;
         if CONNTRACK.insert(&reply_key, &nv, 0).is_ok() {
-            info!(&ctx, "TC NAT LEARN family=4 reply_src={:i} reply_dport={}", dst_ip, sp);
+            info!(
+                &ctx,
+                "TC NAT LEARN family=4 reply_src={:i} reply_dport={}", dst_ip, sp
+            );
         }
         bindings::TC_ACT_OK
     } else if ether_type == EtherType::Ipv6 as u16 {

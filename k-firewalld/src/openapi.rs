@@ -2,7 +2,7 @@
 //!
 //! 端点与 `api.rs` 的路由一一对应；文档 UI 见 `/docs`，规范本体见 `/openapi.json`。
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// 构建 OpenAPI 3.1 文档。
 pub fn openapi_doc() -> Value {

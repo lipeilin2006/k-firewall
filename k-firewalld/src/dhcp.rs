@@ -203,7 +203,9 @@ impl IfaceServer {
 pub fn spawn_servers(config: &Config) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
     for ifc in &config.interfaces {
-        let Some(pool) = &ifc.dhcp6_server else { continue };
+        let Some(pool) = &ifc.dhcp6_server else {
+            continue;
+        };
         let (pool_base, prefix_len) = match parse_pool(pool) {
             Ok(v) => v,
             Err(e) => {
@@ -211,19 +213,17 @@ pub fn spawn_servers(config: &Config) -> Vec<tokio::task::JoinHandle<()>> {
                 continue;
             }
         };
-        let ifindex = match std::fs::read_to_string(format!(
-            "/sys/class/net/{}/ifindex",
-            ifc.phy_name()
-        ))
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        {
-            Some(i) => i,
-            None => {
-                warn!("dhcp6_server {:?}: cannot resolve ifindex", ifc.name);
-                continue;
-            }
-        };
+        let ifindex =
+            match std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", ifc.phy_name()))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                Some(i) => i,
+                None => {
+                    warn!("dhcp6_server {:?}: cannot resolve ifindex", ifc.name);
+                    continue;
+                }
+            };
         let server = IfaceServer {
             name: ifc.name.clone(),
             phy: ifc.phy_name(),
@@ -243,7 +243,10 @@ pub fn spawn_servers(config: &Config) -> Vec<tokio::task::JoinHandle<()>> {
         };
         info!(
             "DHCPv6: serving {}/{} on {} ({})",
-            pool_base, prefix_len, ifc.name, ifc.phy_name()
+            pool_base,
+            prefix_len,
+            ifc.name,
+            ifc.phy_name()
         );
         handles.push(tokio::spawn(run_server(server)));
     }
@@ -319,7 +322,11 @@ fn bind_iface_socket(server: &IfaceServer) -> Result<tokio::net::UdpSocket> {
         )
     };
     if ret != 0 {
-        warn!("DHCPv6 {:?}: IPV6_V6ONLY failed: {}", server.name, std::io::Error::last_os_error());
+        warn!(
+            "DHCPv6 {:?}: IPV6_V6ONLY failed: {}",
+            server.name,
+            std::io::Error::last_os_error()
+        );
     }
     sock.join_multicast_v6(&ALL_DHCP_RELAY_AGENTS_AND_SERVERS, server.ifindex)?;
     sock.set_multicast_loop_v6(false)?;
@@ -335,7 +342,11 @@ fn bind_iface_socket(server: &IfaceServer) -> Result<tokio::net::UdpSocket> {
         )
     };
     if ret != 0 {
-        warn!("DHCPv6 {:?}: IPV6_MULTICAST_HOPS failed: {}", server.name, std::io::Error::last_os_error());
+        warn!(
+            "DHCPv6 {:?}: IPV6_MULTICAST_HOPS failed: {}",
+            server.name,
+            std::io::Error::last_os_error()
+        );
     }
 
     // SO_BINDTODEVICE：只收本接口包（多接口同时监听时互不串扰）。
@@ -361,10 +372,7 @@ fn bind_iface_socket(server: &IfaceServer) -> Result<tokio::net::UdpSocket> {
 }
 
 /// 处理单个 DHCPv6 消息，返回可选的响应报文。
-fn handle_message(
-    server: &IfaceServer,
-    data: &[u8],
-) -> Result<Option<Vec<u8>>> {
+fn handle_message(server: &IfaceServer, data: &[u8]) -> Result<Option<Vec<u8>>> {
     if data.len() < 4 {
         return Ok(None);
     }
@@ -541,7 +549,10 @@ fn alloc_for(server: &IfaceServer, duid: &[u8], iaid: u32) -> Ipv6Addr {
     }
     guard.insert(
         (duid.to_vec(), iaid),
-        Lease { addr, valid_until: now + std::time::Duration::from_secs(VALID as u64) },
+        Lease {
+            addr,
+            valid_until: now + std::time::Duration::from_secs(VALID as u64),
+        },
     );
     addr
 }

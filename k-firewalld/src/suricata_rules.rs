@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use aya::maps::lpm_trie::Key as LpmKey;
 use k_firewall_common::api::SuricataRuleOut;
-use suricatax_rule_parser::scanner::{RuleScanner, RuleScanEvent};
+use suricatax_rule_parser::scanner::{RuleScanEvent, RuleScanner};
 use tracing::{info, warn};
 
 use crate::api::AppState;
@@ -162,7 +162,10 @@ pub struct Expansion {
 
 impl Expansion {
     fn skip(note: impl Into<String>) -> Self {
-        Self { tuples: SuriTuples::default(), note: Some(note.into()) }
+        Self {
+            tuples: SuriTuples::default(),
+            note: Some(note.into()),
+        }
     }
 }
 
@@ -197,7 +200,9 @@ fn addr_spec(spec: &str) -> Result<Vec<(u32, u32)>, SpecErr> {
         Ok(e) => Ok(vec![e]),
         Err(_) => {
             if spec.contains(':') {
-                Err(SpecErr::Skip(format!("IPv6 address {spec:?} (IPv4-only pre-filter)")))
+                Err(SpecErr::Skip(format!(
+                    "IPv6 address {spec:?} (IPv4-only pre-filter)"
+                )))
             } else {
                 Err(SpecErr::Reject(format!("unsupported address {spec:?}")))
             }
@@ -208,14 +213,21 @@ fn addr_spec(spec: &str) -> Result<Vec<(u32, u32)>, SpecErr> {
 /// 解析 IPv4 或 IPv4/CIDR（前缀归一化为网络地址）。
 fn parse_ipv4_cidr(s: &str) -> Result<(u32, u32)> {
     let (ip, prefix) = match s.split_once('/') {
-        Some((ip, p)) => (ip, p.parse::<u32>().map_err(|_| anyhow!("bad prefix {p:?}"))?),
+        Some((ip, p)) => (
+            ip,
+            p.parse::<u32>().map_err(|_| anyhow!("bad prefix {p:?}"))?,
+        ),
         None => (s, 32),
     };
     let ip: Ipv4Addr = ip.parse().map_err(|_| anyhow!("bad IP {ip:?}"))?;
     if prefix > 32 {
         bail!("prefix /{prefix} too long");
     }
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     Ok((u32::from(ip) & mask, prefix))
 }
 
@@ -241,12 +253,14 @@ fn port_spec(spec: &str) -> Result<Vec<u16>, SpecErr> {
         let lo: u16 = if a.is_empty() {
             0
         } else {
-            a.parse().map_err(|_| SpecErr::Reject(format!("bad port range {spec:?}")))? 
+            a.parse()
+                .map_err(|_| SpecErr::Reject(format!("bad port range {spec:?}")))?
         };
         let hi: u16 = if b.is_empty() {
             u16::MAX
         } else {
-            b.parse().map_err(|_| SpecErr::Reject(format!("bad port range {spec:?}")))?
+            b.parse()
+                .map_err(|_| SpecErr::Reject(format!("bad port range {spec:?}")))?
         };
         if hi < lo {
             return Err(SpecErr::Reject(format!("bad port range {spec:?}")));
@@ -258,7 +272,9 @@ fn port_spec(spec: &str) -> Result<Vec<u16>, SpecErr> {
         // 过滤端口 0（作为通配标记，避免误判为通配）。
         return Ok((lo..=hi).filter(|p| *p != 0).collect());
     }
-    let p: u16 = spec.parse().map_err(|_| SpecErr::Reject(format!("bad port {spec:?}")))?;
+    let p: u16 = spec
+        .parse()
+        .map_err(|_| SpecErr::Reject(format!("bad port {spec:?}")))?;
     Ok(vec![p])
 }
 
@@ -427,8 +443,20 @@ pub fn expand_header(parsed: &ParsedRule) -> Result<Expansion> {
         for (dst_net, dst_pfx) in &dsts {
             for sport in &sports {
                 for dport in &dports {
-                    let sp = if portless { None } else if *sport == 0 { None } else { Some(*sport) };
-                    let dp = if portless { Some(0) } else if *dport == 0 { None } else { Some(*dport) };
+                    let sp = if portless {
+                        None
+                    } else if *sport == 0 {
+                        None
+                    } else {
+                        Some(*sport)
+                    };
+                    let dp = if portless {
+                        Some(0)
+                    } else if *dport == 0 {
+                        None
+                    } else {
+                        Some(*dport)
+                    };
                     let fwd = push_orientation(
                         &mut tuples,
                         proto,

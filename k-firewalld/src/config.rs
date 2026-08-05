@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use k_firewall_common::maps::{VifConfig, MODE_ROUTE, MODE_TRANSPARENT, ROLE_INLINE, ROLE_WAN};
+use k_firewall_common::maps::{MODE_ROUTE, MODE_TRANSPARENT, ROLE_INLINE, ROLE_WAN, VifConfig};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -136,8 +136,7 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        Self::from_str(&text)
-            .with_context(|| format!("failed to parse config {}", path.display()))
+        Self::from_str(&text).with_context(|| format!("failed to parse config {}", path.display()))
     }
 
     /// 从 YAML 字符串解析并校验配置（`POST /api/v1/system/config` 恢复用）。
@@ -153,14 +152,13 @@ impl Config {
             dnat.validate().with_context(|| format!("nat_rules[{i}]"))?;
         }
         for (i, rl) in self.rate_limit_rules.iter().enumerate() {
-            rl.validate().with_context(|| format!("rate_limit_rules[{i}]"))?;
+            rl.validate()
+                .with_context(|| format!("rate_limit_rules[{i}]"))?;
         }
         for (i, cl) in self.conn_limits.iter().enumerate() {
             cl.validate().with_context(|| format!("conn_limits[{i}]"))?;
         }
-        self.syn_flood
-            .validate()
-            .context("syn_flood")?;
+        self.syn_flood.validate().context("syn_flood")?;
         if self.stats_interval_secs == 0 {
             bail!("stats_interval_secs must be > 0");
         }
@@ -201,7 +199,8 @@ impl Config {
                 bail!("qos.shaping[{i}]: unknown interface {:?}", s.interface);
             }
             for (j, c) in s.classes.iter().enumerate() {
-                c.validate().with_context(|| format!("qos.shaping[{i}].classes[{j}]"))?;
+                c.validate()
+                    .with_context(|| format!("qos.shaping[{i}].classes[{j}]"))?;
             }
         }
         // peer 必须引用已存在接口。
@@ -224,21 +223,23 @@ impl Config {
         for (i, g) in self.wan_groups.iter().enumerate() {
             for m in &g.members {
                 if !names.contains(m.name.as_str()) {
-                    bail!(
-                        "wan_groups[{i}] {:?}: unknown member {:?}",
-                        g.name,
-                        m.name
-                    );
+                    bail!("wan_groups[{i}] {:?}: unknown member {:?}", g.name, m.name);
                 }
             }
         }
         // zone_policies 引用必须存在。
         for (i, p) in self.zone_policies.iter().enumerate() {
             if !names.contains(p.src_interface.as_str()) {
-                bail!("zone_policies[{i}]: unknown src_interface {:?}", p.src_interface);
+                bail!(
+                    "zone_policies[{i}]: unknown src_interface {:?}",
+                    p.src_interface
+                );
             }
             if !names.contains(p.dst_interface.as_str()) {
-                bail!("zone_policies[{i}]: unknown dst_interface {:?}", p.dst_interface);
+                bail!(
+                    "zone_policies[{i}]: unknown dst_interface {:?}",
+                    p.dst_interface
+                );
             }
             match p.action.as_str() {
                 "accept" | "drop" => {}
@@ -322,9 +323,7 @@ impl Config {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for ifc in &self.interfaces {
-            if ifc.mode == "route"
-                && ifc.nat6.as_deref().unwrap_or("none") == "masquerade"
-            {
+            if ifc.mode == "route" && ifc.nat6.as_deref().unwrap_or("none") == "masquerade" {
                 let phy = ifc.phy_name();
                 if seen.insert(phy.clone()) {
                     out.push(phy);
@@ -344,7 +343,10 @@ impl Config {
                     .interfaces
                     .iter()
                     .find(|i| &i.name == name)
-                    .and_then(|i| std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", i.phy_name())).ok())
+                    .and_then(|i| {
+                        std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", i.phy_name()))
+                            .ok()
+                    })
                     .and_then(|s| s.trim().parse::<u32>().ok())
                     .unwrap_or(0),
                 None => 0,
@@ -379,7 +381,11 @@ impl Config {
                     .and_then(|p| self.interfaces.iter().position(|o| &o.name == p))
                     .map(|i| i as u16)
                     .unwrap_or(0);
-                (ifc.phy_name(), ifc.vlan_id.unwrap_or(0), ifc.to_vif_config(idx as u16, peer_vif_id))
+                (
+                    ifc.phy_name(),
+                    ifc.vlan_id.unwrap_or(0),
+                    ifc.to_vif_config(idx as u16, peer_vif_id),
+                )
             })
             .collect()
     }
@@ -570,7 +576,10 @@ impl InterfaceConfig {
             "wan" => ROLE_WAN,
             "lan" => k_firewall_common::maps::ROLE_LAN,
             "inline" => ROLE_INLINE,
-            other => bail!("{:?}: unsupported role {other:?} (wan|lan|inline)", self.name),
+            other => bail!(
+                "{:?}: unsupported role {other:?} (wan|lan|inline)",
+                self.name
+            ),
         })
     }
 
@@ -832,8 +841,8 @@ impl Conntrack {
             self.tcp_handshake_secs.min(u32::MAX as u64) as u32, // SYN_SENT
             self.tcp_handshake_secs.min(u32::MAX as u64) as u32, // SYN_RECV
             self.tcp_established_secs.min(u32::MAX as u64) as u32,
-            self.tcp_closing_secs.min(u32::MAX as u64) as u32,   // FIN_WAIT
-            self.tcp_closing_secs.min(u32::MAX as u64) as u32,   // CLOSE_WAIT
+            self.tcp_closing_secs.min(u32::MAX as u64) as u32, // FIN_WAIT
+            self.tcp_closing_secs.min(u32::MAX as u64) as u32, // CLOSE_WAIT
             self.tcp_time_wait_secs.min(u32::MAX as u64) as u32, // TIME_WAIT
             self.udp_secs.min(u32::MAX as u64) as u32,
             self.icmp_secs.min(u32::MAX as u64) as u32,
@@ -868,7 +877,10 @@ pub struct Qos {
 
 impl Default for Qos {
     fn default() -> Self {
-        Self { classes: Vec::new(), shaping: Vec::new() }
+        Self {
+            classes: Vec::new(),
+            shaping: Vec::new(),
+        }
     }
 }
 
@@ -987,7 +999,10 @@ impl QosShapingClass {
             bail!("qos shaping: classid is required");
         }
         if self.dscp > 63 {
-            bail!("qos shaping class {}: dscp out of range 0..63", self.classid);
+            bail!(
+                "qos shaping class {}: dscp out of range 0..63",
+                self.classid
+            );
         }
         if self.rate_bps == 0 {
             bail!("qos shaping class {}: rate_bps must be > 0", self.classid);
@@ -1131,4 +1146,3 @@ impl Default for Alg {
         Self { ftp_enabled: false }
     }
 }
-

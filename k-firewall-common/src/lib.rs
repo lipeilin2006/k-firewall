@@ -154,47 +154,47 @@ pub mod api {
         pub dst_port: u16,
         /// CT_STATE_* 名称（SYN_SENT / ESTABLISHED / UDP / ICMP / ...）。
         pub state: String,
-    /// 1 = NAT 回程条目。
-    pub is_nat: bool,
-    pub packets: u32,
-    /// 原始方向（键方向）包数。
-    pub pkts_orig: u32,
-    /// 反向包数。
-    pub pkts_repl: u32,
-    /// 原始方向（键方向）字节数（整帧含 L2 头）。
-    pub bytes_orig: u64,
-    /// 反向字节数（整帧含 L2 头）。
-    pub bytes_repl: u64,
-    /// 最近活跃时刻（CLOCK_MONOTONIC，ns）。
-    pub last_seen_ns: u64,
-    /// 距上次活跃的空闲秒数。
-    pub idle_secs: u64,
-    /// 距该会话被超时回收的剩余秒数（未配置超时的状态为 None）。
-    pub expire_in_secs: Option<u64>,
-    /// 最近活跃的 Unix 时间戳（秒；由 CLOCK_MONOTONIC + 开机偏移换算）。
-    pub last_seen_unix: u64,
-    /// Suricata 检测到的应用层协议（如 http/tls/dns/ssh；未检测为 None）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_proto: Option<String>,
-    /// TLS 指纹（JA3/JA3S，Suricata `tls.fingerprint`）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_fingerprint: Option<String>,
-    /// TLS SNI（ClientHello 中的服务器名）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_sni: Option<String>,
-    /// HTTP Host 头。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_host: Option<String>,
-    /// HTTP User-Agent。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub http_user_agent: Option<String>,
-    /// DNS 查询名。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_query: Option<String>,
-    /// Suricata 会话信息（如 TLS 版本 / HTTP 方法 / DNS 类型）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_info: Option<String>,
-}
+        /// 1 = NAT 回程条目。
+        pub is_nat: bool,
+        pub packets: u32,
+        /// 原始方向（键方向）包数。
+        pub pkts_orig: u32,
+        /// 反向包数。
+        pub pkts_repl: u32,
+        /// 原始方向（键方向）字节数（整帧含 L2 头）。
+        pub bytes_orig: u64,
+        /// 反向字节数（整帧含 L2 头）。
+        pub bytes_repl: u64,
+        /// 最近活跃时刻（CLOCK_MONOTONIC，ns）。
+        pub last_seen_ns: u64,
+        /// 距上次活跃的空闲秒数。
+        pub idle_secs: u64,
+        /// 距该会话被超时回收的剩余秒数（未配置超时的状态为 None）。
+        pub expire_in_secs: Option<u64>,
+        /// 最近活跃的 Unix 时间戳（秒；由 CLOCK_MONOTONIC + 开机偏移换算）。
+        pub last_seen_unix: u64,
+        /// Suricata 检测到的应用层协议（如 http/tls/dns/ssh；未检测为 None）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub app_proto: Option<String>,
+        /// TLS 指纹（JA3/JA3S，Suricata `tls.fingerprint`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tls_fingerprint: Option<String>,
+        /// TLS SNI（ClientHello 中的服务器名）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tls_sni: Option<String>,
+        /// HTTP Host 头。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub http_host: Option<String>,
+        /// HTTP User-Agent。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub http_user_agent: Option<String>,
+        /// DNS 查询名。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dns_query: Option<String>,
+        /// Suricata 会话信息（如 TLS 版本 / HTTP 方法 / DNS 类型）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub app_info: Option<String>,
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SessionsOut {

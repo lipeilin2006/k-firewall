@@ -35,10 +35,7 @@ fn tc(args: &[&str]) -> Result<()> {
 
 /// 解析 classid 的小号（default 参数只用 minor 十进制）。如 `1:10` -> `10`。
 fn class_minor(classid: &str) -> Result<u32> {
-    let minor = classid
-        .split_once(':')
-        .map(|(_, m)| m)
-        .unwrap_or(classid);
+    let minor = classid.split_once(':').map(|(_, m)| m).unwrap_or(classid);
     let minor = minor.trim();
     let minor = if let Some(hex) = minor.strip_prefix("0x") {
         u32::from_str_radix(hex, 16).with_context(|| format!("bad classid {classid:?}"))?
@@ -62,7 +59,10 @@ pub fn setup_shaping(config: &Config) -> Result<()> {
         let phy = match config.interfaces.iter().find(|i| &i.name == &s.interface) {
             Some(ifc) => ifc.phy_name(),
             None => {
-                warn!("qos.shaping: interface {:?} not found, skipped", s.interface);
+                warn!(
+                    "qos.shaping: interface {:?} not found, skipped",
+                    s.interface
+                );
                 continue;
             }
         };
@@ -77,7 +77,15 @@ fn apply_shaping(phy: &str, s: &crate::config::QosShaping) -> Result<()> {
 
     let default_minor = class_minor(&s.default_classid)?;
     tc(&[
-        "qdisc", "add", "dev", phy, "root", "handle", "1:", "htb", "default",
+        "qdisc",
+        "add",
+        "dev",
+        phy,
+        "root",
+        "handle",
+        "1:",
+        "htb",
+        "default",
         &default_minor.to_string(),
     ])
     .with_context(|| format!("add htb root qdisc on {phy}"))?;
@@ -118,45 +126,13 @@ fn apply_shaping(phy: &str, s: &crate::config::QosShaping) -> Result<()> {
         let tos_value = (c.dscp as u32) << 2;
         let tos_hex = format!("0x{tos_value:x}");
         tc(&[
-            "filter",
-            "add",
-            "dev",
-            phy,
-            "parent",
-            "1:",
-            "protocol",
-            "ip",
-            "prio",
-            "1",
-            "u32",
-            "match",
-            "ip",
-            "tos",
-            &tos_hex,
-            "0xfc",
-            "flowid",
-            &c.classid,
+            "filter", "add", "dev", phy, "parent", "1:", "protocol", "ip", "prio", "1", "u32",
+            "match", "ip", "tos", &tos_hex, "0xfc", "flowid", &c.classid,
         ])
         .with_context(|| format!("add ipv4 dscp filter {} on {phy}", c.classid))?;
         tc(&[
-            "filter",
-            "add",
-            "dev",
-            phy,
-            "parent",
-            "1:",
-            "protocol",
-            "ipv6",
-            "prio",
-            "1",
-            "u32",
-            "match",
-            "ip6",
-            "priority",
-            &tos_hex,
-            "0xfc",
-            "flowid",
-            &c.classid,
+            "filter", "add", "dev", phy, "parent", "1:", "protocol", "ipv6", "prio", "1", "u32",
+            "match", "ip6", "priority", &tos_hex, "0xfc", "flowid", &c.classid,
         ])
         .with_context(|| format!("add ipv6 dscp filter {} on {phy}", c.classid))?;
 
